@@ -123,6 +123,20 @@ A question with no `validated` block still works on the shipped defaults (0.9 / 
 every answer is marked `thresholds: default` so a default is never mistaken for a finding.
 Those defaults are deliberately too conservative for real traffic. Go and measure.
 
+**Pin the model id at the precision you actually mean.** The API answers with a dated build
+— you ask for `typesafe/jev-1.13` and it replies `typesafe/jev-1.13-20260917`. The check is
+a prefix, so `"model": "typesafe/jev-1.13"` accepts any build of 1.13, while
+`"model": "typesafe/jev-1.13-20260917"` accepts only that one and turns every answer into
+`unsure` the day the build rotates. The second is what you want for a threshold you are
+relying on; the first is for a question where you would rather keep an approximate answer
+than lose it.
+
+**And measuring a threshold is harder than it sounds.** One run here fitted a cut that made
+zero errors over 40 rows — and fitting on 20 of them and testing on the other 20, over 200
+splits, averaged 0.41 errors with 39% of splits making at least one. Tens of rows are not
+enough to tune a cut; they are enough to find out whether the shipped defaults already work,
+which in that run they did across 242 judgements.
+
 ## In a hook
 
 `--soft` is the never-fail-loudly mode: no key, no network, an API error, all become exit 0
@@ -138,6 +152,35 @@ exit 0
 
 `JEVI_DISABLE=1` turns every call into "no answer" without touching the scripts that call
 it — the panic switch for a fleet you cannot edit quickly.
+
+## Before you trust a question
+
+This costs nothing and it goes **before** any measurement, because it can rule a question
+out without a single call:
+
+> Find the case where the correct answer is the one that looks **least** like the question.
+> If that case exists, the question does not work.
+
+Jev matches what is in front of it. Usually the right answer and the question share
+vocabulary, and that is why it scores so well on "does this text mention X". The trap is a
+question where the truth runs the other way, and then it is confidently wrong rather than
+unsure.
+
+The case that produced this rule: driving an iOS Settings screen, asking "is the goal
+reached?". The **wrong** screen contains the string "Display & Text Size" — because that is
+the row you still have to tap. The **right** screen does not contain it, because it is
+showing that row's contents. Measured: "done" 5/5 at 0.90-0.92 on the wrong screen, 5/5 at
+0.82-0.87 on the right one. More confidence in the wrong case. Matching text and judging
+state give opposite answers at exactly the moment that matters.
+
+A second one, smaller and cheaper to hit: the same factual question scored 6/6 until the
+word "exactly" was added to it, and then went unsure 3/3 — because the real label was
+"Larger Text, No" and "exactly" quietly turned a question about content into one about the
+literal string, which carries the switch's value. **Wording moves the answer even when the
+fact does not.**
+
+Both were found by measuring, which is expensive. The rule above would have predicted them
+for free, so run it first and keep the positive controls for what survives.
 
 ## What this is not
 
