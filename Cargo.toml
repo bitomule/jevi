@@ -12,6 +12,14 @@ keywords = ["jev", "typesafe", "classifier", "cli", "hooks"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["/.github", "/questions/examples"]
 
+[lib]
+name = "jevi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jevi"
+path = "src/main.rs"
+
 [features]
 default = []
 # Trust the operating system's certificate store instead of the roots compiled in. Only

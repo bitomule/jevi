@@ -1,30 +1,24 @@
 //! jevi — ask typed questions about a text and branch on the answer.
 //!
-//! The exit-code map lives here and nowhere else, and it has one hard rule: never exit 2.
-//! Claude Code reads a hook's exit 2 as "block this tool call and hand my stderr to the
-//! model", so a mistyped flag in a hook would become a block on the thing it hooks. clap
-//! exits 2 by default, which is why this uses `try_parse` and maps its errors to 5.
+//! This is the shell around the library: argument parsing, printing, and the exit-code map.
+//! Nothing here decides anything about an answer; that all lives in the `jevi` crate, so a
+//! caller that wants the judgements without the terminal can depend on the library alone.
+//!
+//! The exit-code map has one hard rule: never exit 2. Claude Code reads a hook's exit 2 as
+//! "block this tool call and hand my stderr to the model", so a mistyped flag in a hook
+//! would become a block on the thing it hooks. clap exits 2 by default, which is why this
+//! uses `try_parse` and maps its errors to 5.
 
 mod cli;
-mod config;
-mod decide;
-mod error;
-mod http;
-mod output;
-mod provider;
-mod questions;
 
 use std::io::{IsTerminal, Read, Write};
-use std::time::Instant;
 
 use clap::Parser;
 use serde_json::Value;
 
+use jevi::{AskOptions, Config, Error, Provider, QuestionSet, Result, Verdict};
+
 use crate::cli::{Ask, Cli, Command, ConfigCmd};
-use crate::config::Config;
-use crate::decide::{Provenance, Verdict};
-use crate::error::{Error, Result};
-use crate::provider::Provider;
 
 fn main() {
     let cli = match Cli::try_parse() {
@@ -46,8 +40,7 @@ fn main() {
         Ok(code) => code,
         Err(e) => {
             if soft {
-                let doc = output::failure(e.kind(), &e.to_string());
-                println!("{doc}");
+                println!("{}", jevi::failure_document(e.kind(), &e.to_string()));
                 0
             } else {
                 eprintln!("jevi: {e}");
@@ -79,9 +72,9 @@ fn ask(a: Ask) -> Result<i32> {
         }
         (Some(name), None) => {
             let (raw, origin) = cfg.resolve_set(name)?;
-            questions::QuestionSet::parse(&raw, &origin)?.prepare()?
+            QuestionSet::parse(&raw, &origin)?.prepare()?
         }
-        (None, Some(text)) => questions::shorthand(
+        (None, Some(text)) => jevi::internal::shorthand(
             text,
             a.options.as_deref(),
             a.levels.as_deref(),
@@ -105,77 +98,48 @@ fn ask(a: Ask) -> Result<i32> {
     let cap = a.max_chars.or(prepared.max_chars).unwrap_or(80_000);
     let (state, state_chars) = build_state(&raw_state, a.state_json, cap)?;
 
-    let p = cfg.provider(a.provider.as_deref())?;
-    let key = cfg.key_for(p).ok_or_else(|| {
-        Error::no_answer(
-            "no_key",
-            format!(
-                "no credential for {} (set {} or run `jevi config set-key {}`)",
-                p.name(),
-                p.env_key(),
-                p.name()
-            ),
-        )
-    })?;
-    let model = prepared
-        .model
-        .clone()
-        .unwrap_or_else(|| cfg.model(p, a.model.as_deref()));
-    let url = cfg.url(p);
-    let timeout = cfg.timeout_ms(a.timeout);
-
-    let body = p.body(&model, &state, &prepared.wire);
-    let started = Instant::now();
-    let response_body = http::post(&url, &key, &body, timeout)?;
-    let latency = started.elapsed().as_millis();
+    let opts = AskOptions {
+        provider: a.provider.clone(),
+        model: a.model.clone(),
+        timeout_ms: a.timeout,
+        state_chars: Some(state_chars),
+    };
 
     if a.raw {
-        println!("{response_body}");
+        println!("{}", jevi::ask_raw(&cfg, &prepared, &state, &opts)?);
         return Ok(0);
     }
 
-    let response = provider::read(&response_body)?;
-    let provenance = Provenance {
-        model_used: response.model.as_deref(),
-        state_chars,
-    };
-
-    let mut outcomes = Vec::with_capacity(prepared.names.len());
-    for (name, decide) in prepared.names.iter().zip(&prepared.decide) {
-        let answer = response.answers.get(name).cloned().unwrap_or(Value::Null);
-        outcomes.push(decide::outcome(&answer, decide, &provenance));
-    }
+    let answered = jevi::ask(&cfg, &prepared, &state, &opts)?;
 
     if a.json {
-        let doc = output::document(
-            &prepared.names,
-            &outcomes,
-            p.name(),
-            response.model.as_deref(),
-            response.usage.as_ref(),
-            latency,
-        );
-        println!("{doc}");
+        println!("{}", jevi::document(&answered));
     } else {
-        print!("{}", output::terse(&prepared.names, &outcomes, single));
+        print!(
+            "{}",
+            jevi::internal::terse(&answered.names, &answered.outcomes, single)
+        );
     }
 
     if a.verbose {
-        let usage = response
+        let usage = answered
             .usage
             .as_ref()
             .map(ToString::to_string)
             .unwrap_or_default();
-        eprintln!("jevi: {latency}ms {usage}");
+        eprintln!("jevi: {}ms {usage}", answered.latency_ms);
     }
 
     // The code describes the first question, except that any uncertainty anywhere wins:
     // a caller gating on this should stop when any part of the answer is unknown.
-    let any_unsure = outcomes.iter().any(|o| o.verdict == Verdict::Unsure);
+    let any_unsure = answered
+        .outcomes
+        .iter()
+        .any(|o| o.verdict == Verdict::Unsure);
     Ok(if any_unsure {
         3
     } else {
-        outcomes[0].verdict.code()
+        answered.outcomes[0].verdict.code()
     })
 }
 
@@ -227,7 +191,7 @@ fn build_state(raw: &str, as_json: bool, cap: usize) -> Result<(Value, usize)> {
 fn doctor(live: bool) -> Result<i32> {
     let cfg = Config::load()?;
     let p = cfg.provider(None)?;
-    let path = config::config_path();
+    let path = jevi::config_path();
 
     println!(
         "config:    {} ({})",
@@ -257,7 +221,7 @@ fn doctor(live: bool) -> Result<i32> {
     println!("url:       {}", cfg.url(p));
     println!(
         "questions: {}",
-        config::config_dir().join("questions").display()
+        jevi::config_dir().join("questions").display()
     );
     if std::env::var("JEVI_DISABLE").is_ok_and(|v| !v.is_empty() && v != "0") {
         println!("JEVI_DISABLE is set: every `ask` will return no answer.");
@@ -267,23 +231,14 @@ fn doctor(live: bool) -> Result<i32> {
         return Ok(0);
     }
 
-    let key = cfg
-        .key_for(p)
-        .ok_or_else(|| Error::no_answer("no_key", format!("no credential for {}", p.name())))?;
-    let prepared = questions::shorthand("This text mentions a cat.", None, None, None, None, None)?;
-    let body = p.body(
-        &cfg.model(p, None),
-        &Value::String("The cat sat on the mat.".into()),
-        &prepared.wire,
-    );
-    let started = Instant::now();
-    let response_body = http::post(&cfg.url(p), &key, &body, cfg.timeout_ms(None))?;
-    let response = provider::read(&response_body)?;
+    let prepared = jevi::shorthand("This text mentions a cat.")?;
+    let state = Value::String("The cat sat on the mat.".into());
+    let answered = jevi::ask(&cfg, &prepared, &state, &AskOptions::default())?;
     println!(
         "live:      ok in {}ms, model {}, usage {}",
-        started.elapsed().as_millis(),
-        response.model.as_deref().unwrap_or("?"),
-        response
+        answered.latency_ms,
+        answered.model.as_deref().unwrap_or("?"),
+        answered
             .usage
             .map(|u| u.to_string())
             .unwrap_or_else(|| "?".into())
@@ -302,7 +257,7 @@ fn set_key(name: &str) -> Result<i32> {
         return Err(Error::invalid("stdin", "no key on stdin"));
     }
 
-    let path = config::config_path();
+    let path = jevi::config_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::invalid("config", format!("{}: {e}", dir.display())))?;
