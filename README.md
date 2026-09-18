@@ -271,6 +271,32 @@ All of this was found by measuring, which is expensive. The rule at the top of t
 would have predicted the first case for free, so run it first and keep the positive controls
 for what survives.
 
+## Outside English it loses coverage, not correctness
+
+TypeSafe documents English as the primary training language and says other languages have
+"lower accuracy". Measured on real translation pairs from shipped app catalogues, asking
+whether a translation says the same thing as its source — 178 judgements, **zero wrong
+answers**:
+
+| | correct | wrong | unsure |
+|---|---|---|---|
+| German, healthy pairs (n=30) | 25 | **0** | 5 — **17%** |
+| Spanish, healthy pairs (n=30) | 29 | **0** | 1 — 3% |
+| Obvious mutant, both languages | 30/30 | 0 | 0 |
+
+German abstained nearly six times as often as Spanish and was never wrong. So the gap is
+real but it is **coverage, not correctness**: you lose answers, you do not gain bad ones.
+That is worth knowing before you rule a language out, and it pairs well with a design where
+`unsure` costs nothing — a tripwire that acts only on a confident `no` and lets everything
+else pass in silence pays nothing at all for that 17%.
+
+The same run found the other half of this, and it is the sharper lesson: asking for a **style
+or terminology** judgement with no lexical anchor returned **25 unsure out of 25** on healthy
+input, with and without the correct term supplied as a computed fact. No signal whatsoever.
+The family of question that sounds like taste — "does this use the word the platform would
+use?" — turns out to be a glossary, which is to say code: a list of banned terms finds those
+cases in milliseconds and jev cannot find them at all.
+
 ## What this is not
 
 **Jev is not a security boundary, and neither is `jevi`.** It is measurably steerable by the
