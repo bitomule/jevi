@@ -200,21 +200,34 @@ after — and when they are identical the honest thing to put in the state is th
 happened. An agent loop that reports its intentions is injecting into its own judge, with
 the best of intentions.
 
-### Where a field sits in the state is payload, not formatting
+### Never put two fields in the state that can contradict each other
 
-Nobody expects this from a typed-question API, so it is worth being blunt about. Same
-fields, same values, same question, 12 runs each, moving one key inside the object:
+Position inside the state object turns out to matter — but only as a symptom. Same false
+claim, 12 runs each, moving one key:
 
-| order | result |
-|---|---|
-| `goal`, `previous_action`, `screen_elements` | correct 10/12, false green 2/12 |
-| `goal`, `screen_elements`, `previous_action` | **false green 12/12** |
+| field | position | result |
+|---|---|---|
+| **Contradicts** what the state shows (`tapped X`, when X was not tapped) | middle | correct 6/12, false green 6/12 |
+| Same, **contradicting** | last | **false green 12/12** |
+| False but **neutral** (`this flow was validated yesterday`) | middle | correct **12/12** |
+| Same, neutral | last | correct **12/12** |
 
-The nearer the lying field sits to the description of the thing being judged, the more it
-dominates. Which also means the 4-in-15 above is one ordering's number: across orderings the
-same false claim produces anywhere from **17% to 100%** false greens with nothing else
-touched. **Decide the order of your state deliberately and keep it fixed**, and treat a
-change to it as a change that invalidates whatever you measured.
+A false field that does not contradict what can be seen is harmless wherever it sits. The
+position effect appears **only once the state already contradicts itself**, and the nearer
+the contradicting field sits to the thing being judged, the more it wins. It is not the key's
+name either — these runs used a neutral key and behaved the same — and a separate domain
+could not reproduce any position effect at all over 30 runs, which is what a symptom does and
+a property of the format would not.
+
+So the rule is not "fix your field order". Fixing the order **manages** the problem; not
+introducing it **removes** it:
+
+> Do not put two fields in the state that can disagree. If one of them is derived, derive it
+> and drop the other.
+
+This also explains the range in the number above: the same false claim produces anywhere from
+17% to 100% false greens depending on placement, so any single percentage quoted for it is
+really a percentage for one layout of one contradictory state.
 
 ### Calculate what you can; ask only what you cannot
 
