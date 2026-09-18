@@ -96,28 +96,46 @@ fn ask(a: Ask) -> Result<i32> {
     // The cap is the question set's when it has one, because that is the length its
     // thresholds were measured at.
     let cap = a.max_chars.or(prepared.max_chars).unwrap_or(80_000);
-    let (state, state_chars) = build_state(&raw_state, a.state_json, cap)?;
+    let built = build_state(&raw_state, a.state_json, cap)?;
 
     let opts = AskOptions {
         provider: a.provider.clone(),
         model: a.model.clone(),
         timeout_ms: a.timeout,
-        state_chars: Some(state_chars),
+        state_chars: Some(built.chars),
     };
 
     if a.raw {
-        println!("{}", jevi::ask_raw(&cfg, &prepared, &state, &opts)?);
+        println!("{}", jevi::ask_raw(&cfg, &prepared, &built.state, &opts)?);
         return Ok(0);
     }
 
-    let answered = jevi::ask(&cfg, &prepared, &state, &opts)?;
+    let answered = jevi::ask(&cfg, &prepared, &built.state, &opts)?;
 
+    // A truncated state is judged on part of itself and the answer looks exactly like a
+    // complete one. That is the shape of failure this whole tool is built to avoid, so it is
+    // reported in both outputs and never only inside the text the model sees: a caller
+    // parsing the JSON, and a person reading the terminal, both have to be able to tell.
     if a.json {
-        println!("{}", jevi::document(&answered));
+        let mut doc = jevi::document(&answered);
+        if built.dropped > 0 {
+            doc["truncated"] = serde_json::json!({
+                "kept_chars": built.chars,
+                "dropped_chars": built.dropped,
+            });
+        }
+        println!("{doc}");
     } else {
         print!(
             "{}",
             jevi::internal::terse(&answered.names, &answered.outcomes, single)
+        );
+    }
+    if built.dropped > 0 {
+        eprintln!(
+            "jevi: the state was cut to {} characters and {} were dropped — this answer is \
+             about part of the input. Raise --max-chars, or pass 0 to send it whole.",
+            built.chars, built.dropped
         );
     }
 
@@ -164,7 +182,16 @@ fn read_state(a: &Ask) -> Result<String> {
     Ok(buf)
 }
 
-fn build_state(raw: &str, as_json: bool, cap: usize) -> Result<(Value, usize)> {
+/// What happened to the state on its way in. `dropped > 0` means the model did not see all
+/// of it, and that has to reach the caller — see the note on `report` below.
+#[derive(Debug)]
+struct Built {
+    state: Value,
+    chars: usize,
+    dropped: usize,
+}
+
+fn build_state(raw: &str, as_json: bool, cap: usize) -> Result<Built> {
     if raw.trim().is_empty() {
         return Err(Error::invalid("state", "the text to judge is empty"));
     }
@@ -174,18 +201,27 @@ fn build_state(raw: &str, as_json: bool, cap: usize) -> Result<(Value, usize)> {
         let v: Value = serde_json::from_str(raw)
             .map_err(|e| Error::invalid("state", format!("--state-json but not JSON: {e}")))?;
         let len = raw.chars().count();
-        return Ok((v, len));
+        return Ok(Built {
+            state: v,
+            chars: len,
+            dropped: 0,
+        });
     }
     let len = raw.chars().count();
     if cap > 0 && len > cap {
         let head: String = raw.chars().take(cap).collect();
-        let cut = len - cap;
-        return Ok((
-            Value::String(format!("{head}\n\n[jevi: {cut} characters truncated]")),
-            cap,
-        ));
+        let dropped = len - cap;
+        return Ok(Built {
+            state: Value::String(format!("{head}\n\n[jevi: {dropped} characters truncated]")),
+            chars: cap,
+            dropped,
+        });
     }
-    Ok((Value::String(raw.to_owned()), len))
+    Ok(Built {
+        state: Value::String(raw.to_owned()),
+        chars: len,
+        dropped: 0,
+    })
 }
 
 fn doctor(live: bool) -> Result<i32> {
@@ -304,19 +340,39 @@ mod tests {
     #[test]
     fn a_long_string_state_is_truncated_and_says_so() {
         let raw = "x".repeat(200);
-        let (v, chars) = build_state(&raw, false, 50).expect("builds");
-        assert_eq!(chars, 50);
-        assert!(v
+        let b = build_state(&raw, false, 50).expect("builds");
+        assert_eq!(b.chars, 50);
+        assert!(b
+            .state
             .as_str()
             .expect("string")
             .contains("150 characters truncated"));
     }
 
     #[test]
+    fn truncation_is_reported_to_the_caller_not_only_to_the_model() {
+        // The marker inside the text is for the model to read. `dropped` is for whoever has
+        // to decide whether this answer is about the whole input — and until it existed, a
+        // state cut in half produced a document indistinguishable from a complete one.
+        assert_eq!(
+            build_state(&"x".repeat(200), false, 50)
+                .expect("builds")
+                .dropped,
+            150
+        );
+    }
+
+    #[test]
+    fn a_state_that_fits_reports_nothing_dropped() {
+        assert_eq!(build_state("short", false, 50).expect("builds").dropped, 0);
+    }
+
+    #[test]
     fn a_json_state_is_never_truncated() {
         let raw = format!(r#"{{"a":"{}"}}"#, "x".repeat(200));
-        let (v, _) = build_state(&raw, true, 50).expect("builds");
-        assert_eq!(v["a"].as_str().expect("string").len(), 200);
+        let b = build_state(&raw, true, 50).expect("builds");
+        assert_eq!(b.state["a"].as_str().expect("string").len(), 200);
+        assert_eq!(b.dropped, 0);
     }
 
     #[test]
