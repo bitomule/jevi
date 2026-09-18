@@ -12,12 +12,22 @@ keywords = ["jev", "typesafe", "classifier", "cli", "hooks"]
 categories = ["command-line-utilities", "development-tools"]
 exclude = ["/.github", "/questions/examples"]
 
+[features]
+default = []
+# Trust the operating system's certificate store instead of the roots compiled in. Only
+# needed behind a TLS-inspecting proxy that signs with a private CA — a corporate network,
+# typically. It is off by default because it is expensive in a way that is invisible from
+# the Cargo.toml: it pulls the certificate stores of three operating systems AND the Android
+# JNI bindings, 53 packages against 47. For a tool that talks to one public endpoint, the
+# bundled roots are the right trade.
+system-roots = ["ureq/platform-verifier"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "json"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [dev-dependencies]
 assert_cmd = "2"
