@@ -13,14 +13,22 @@ use std::process::{Command, Stdio};
 use assert_cmd::prelude::*;
 
 /// A config pointing at a port nothing listens on: every call fails to connect, fast.
-fn offline_config() -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("jevi-offline-{}.json", std::process::id()));
-    std::fs::write(
-        &path,
-        r#"{"openrouter":{"api_key":"test","base_url":"http://127.0.0.1:9/decisions"}}"#,
-    )
-    .expect("writes the fixture");
-    path
+///
+/// Written exactly once. Cargo runs these tests as threads of ONE process, so a path keyed
+/// on the pid is shared by all of them — and every test rewriting it meant one could read it
+/// mid-write, get invalid JSON, and see exit 5 (bad config) where it expected 4 or 0. On
+/// macOS the race never landed; on Linux CI two tests failed every run.
+fn offline_config() -> &'static std::path::Path {
+    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!("jevi-offline-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"openrouter":{"api_key":"test","base_url":"http://127.0.0.1:9/decisions"}}"#,
+        )
+        .expect("writes the fixture");
+        path
+    })
 }
 
 fn run(args: &[&str], stdin: &str) -> std::process::Output {
