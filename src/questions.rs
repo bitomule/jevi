@@ -13,6 +13,42 @@ pub const DEFAULT_YES: f64 = 0.9;
 pub const DEFAULT_NO: f64 = 0.1;
 pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.9;
 
+/// What the API actually refuses, measured against it: 255 options is accepted and 256
+/// comes back `Too many choices. Must have at most 255 choices.`
+const MAX_CHOICES: usize = 255;
+/// What the documentation recommends. Not a limit — a hint about where accuracy starts to
+/// suffer, so it is a warning and never a refusal.
+const RECOMMENDED_CHOICES: usize = 8;
+
+/// This refused anything over 8 because the docs say "2-8 options", and turning a
+/// recommendation into a hard block cost someone a real use case: choosing among the seven
+/// tappable rows of an iOS Settings screen plus "scroll" and "done" is nine, and jevi
+/// rejected the call before it ever reached an API that would have answered it fine.
+///
+/// The rule now is the one a wrapper should follow: refuse what the service refuses, warn
+/// about what the service merely discourages.
+fn check_choice_len(name: &str, len: usize) -> Result<()> {
+    if len < 2 {
+        return Err(Error::invalid(
+            "question_file",
+            format!("question `{name}`: choice needs at least 2 options, got {len}"),
+        ));
+    }
+    if len > MAX_CHOICES {
+        return Err(Error::invalid(
+            "question_file",
+            format!("question `{name}`: choice takes at most {MAX_CHOICES} options, got {len}"),
+        ));
+    }
+    if len > RECOMMENDED_CHOICES {
+        eprintln!(
+            "jevi: question `{name}` has {len} options; TypeSafe documents 2-{RECOMMENDED_CHOICES}. \
+             It will answer, but validate that it still answers well at this width."
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuestionSet {
@@ -147,9 +183,7 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
                 .get("criteria")
                 .and_then(Value::as_object)
                 .ok_or_else(|| bad("choice needs `criteria` as an object of options".into()))?;
-            if !(2..=8).contains(&c.len()) {
-                return Err(bad(format!("choice needs 2-8 options, got {}", c.len())));
-            }
+            check_choice_len(name, c.len())?;
         }
         "score" => {
             let c = obj
@@ -250,12 +284,7 @@ pub fn shorthand(
         }
         (Some(list), None) => {
             let items = split_list(list, "--options")?;
-            if !(2..=8).contains(&items.len()) {
-                return Err(Error::invalid(
-                    "flags",
-                    format!("--options takes 2-8 values, got {}", items.len()),
-                ));
-            }
+            check_choice_len("answer", items.len())?;
             let map: Map<String, Value> = items
                 .iter()
                 .map(|o| (o.clone(), Value::String(o.clone())))
@@ -361,15 +390,47 @@ mod tests {
         assert!(set.prepare().is_err());
     }
 
+    fn choice_with(n: usize) -> Result<Prepared> {
+        let crit: Vec<String> = (0..n).map(|i| format!(r#""o{i}":"opcion {i}""#)).collect();
+        QuestionSet::parse(
+            &format!(
+                r#"{{"version":1,"questions":{{"q":{{"type":"choice","instructions":"i",
+                   "criteria":{{{}}}}}}}}}"#,
+                crit.join(",")
+            ),
+            "test",
+        )?
+        .prepare()
+    }
+
     #[test]
-    fn choice_option_count_is_checked_before_the_network() {
-        let set = QuestionSet::parse(
-            r#"{"version":1,"questions":{"q":{"type":"choice","instructions":"i",
-                 "criteria":{"only":"one"}}}}"#,
+    fn one_option_is_not_a_choice() {
+        assert!(choice_with(1).is_err());
+    }
+
+    #[test]
+    fn more_than_eight_options_is_allowed_because_the_api_allows_it() {
+        // The case this was blocking: seven tappable rows plus "scroll" and "done".
+        assert!(choice_with(9).is_ok());
+        assert!(choice_with(255).is_ok());
+    }
+
+    #[test]
+    fn past_what_the_api_takes_is_refused_here_instead_of_over_the_wire() {
+        assert!(choice_with(256).is_err());
+    }
+
+    #[test]
+    fn score_levels_are_still_capped_at_what_the_api_enforces() {
+        // Measured: 10 levels are accepted, 11 come back
+        // `Too many score levels. Must have at most 10 levels.`
+        let over = QuestionSet::parse(
+            r#"{"version":1,"questions":{"q":{"type":"score","instructions":"i",
+               "criteria":["a","b","c","d","e","f","g","h","i","j","k"]}}}"#,
             "test",
         )
         .expect("parses");
-        assert!(set.prepare().is_err());
+        assert!(over.prepare().is_err());
     }
 
     #[test]

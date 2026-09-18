@@ -123,6 +123,20 @@ A question with no `validated` block still works on the shipped defaults (0.9 / 
 every answer is marked `thresholds: default` so a default is never mistaken for a finding.
 Those defaults are deliberately too conservative for real traffic. Go and measure.
 
+**Pin the model id at the precision you actually mean.** The API answers with a dated build
+— you ask for `typesafe/jev-1.13` and it replies `typesafe/jev-1.13-20260917`. The check is
+a prefix, so `"model": "typesafe/jev-1.13"` accepts any build of 1.13, while
+`"model": "typesafe/jev-1.13-20260917"` accepts only that one and turns every answer into
+`unsure` the day the build rotates. The second is what you want for a threshold you are
+relying on; the first is for a question where you would rather keep an approximate answer
+than lose it.
+
+**And measuring a threshold is harder than it sounds.** One run here fitted a cut that made
+zero errors over 40 rows — and fitting on 20 of them and testing on the other 20, over 200
+splits, averaged 0.41 errors with 39% of splits making at least one. Tens of rows are not
+enough to tune a cut; they are enough to find out whether the shipped defaults already work,
+which in that run they did across 242 judgements.
+
 ## In a hook
 
 `--soft` is the never-fail-loudly mode: no key, no network, an API error, all become exit 0
