@@ -153,6 +153,35 @@ exit 0
 `JEVI_DISABLE=1` turns every call into "no answer" without touching the scripts that call
 it — the panic switch for a fleet you cannot edit quickly.
 
+## Before you trust a question
+
+This costs nothing and it goes **before** any measurement, because it can rule a question
+out without a single call:
+
+> Find the case where the correct answer is the one that looks **least** like the question.
+> If that case exists, the question does not work.
+
+Jev matches what is in front of it. Usually the right answer and the question share
+vocabulary, and that is why it scores so well on "does this text mention X". The trap is a
+question where the truth runs the other way, and then it is confidently wrong rather than
+unsure.
+
+The case that produced this rule: driving an iOS Settings screen, asking "is the goal
+reached?". The **wrong** screen contains the string "Display & Text Size" — because that is
+the row you still have to tap. The **right** screen does not contain it, because it is
+showing that row's contents. Measured: "done" 5/5 at 0.90-0.92 on the wrong screen, 5/5 at
+0.82-0.87 on the right one. More confidence in the wrong case. Matching text and judging
+state give opposite answers at exactly the moment that matters.
+
+A second one, smaller and cheaper to hit: the same factual question scored 6/6 until the
+word "exactly" was added to it, and then went unsure 3/3 — because the real label was
+"Larger Text, No" and "exactly" quietly turned a question about content into one about the
+literal string, which carries the switch's value. **Wording moves the answer even when the
+fact does not.**
+
+Both were found by measuring, which is expensive. The rule above would have predicted them
+for free, so run it first and keep the positive controls for what survives.
+
 ## What this is not
 
 **Jev is not a security boundary, and neither is `jevi`.** It is measurably steerable by the
