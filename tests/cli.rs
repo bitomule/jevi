@@ -35,12 +35,22 @@ fn run(args: &[&str], stdin: &str) -> std::process::Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawns");
-    child
+    // A broken pipe here is the binary doing its job, not a failure: several of these cases
+    // are refused before stdin is ever read (a bad flag, a missing question set), so the
+    // child can be gone before the write lands. It is a race, and on a fast machine the
+    // write usually wins — this only showed up on CI. Everything else is still an error.
+    if let Err(e) = child
         .stdin
         .as_mut()
         .expect("stdin")
         .write_all(stdin.as_bytes())
-        .expect("writes stdin");
+    {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "writing stdin failed for a reason other than the child exiting early"
+        );
+    }
     child.wait_with_output().expect("runs")
 }
 
