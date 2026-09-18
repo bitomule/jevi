@@ -19,4 +19,12 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 pr-run-mode = "plan"
 
 [dist.github-custom-runners]
+# dist 0.27 still generates `runs-on: ubuntu-20.04` for its own plan/publish jobs, and
+# GitHub has retired that image. A workflow asking for a label that no longer exists does
+# not fail — it sits QUEUED forever, which is why three Release runs never started and
+# looked like a GitHub backlog rather than our configuration.
+global = "ubuntu-latest"
 aarch64-apple-darwin = "macos-14"
+x86_64-apple-darwin = "macos-14"
+aarch64-unknown-linux-gnu = "ubuntu-latest"
+x86_64-unknown-linux-gnu = "ubuntu-latest"
