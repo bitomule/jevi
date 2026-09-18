@@ -1,0 +1,58 @@
+name: release-plz
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+  # Required for Trusted Publishing: this is what lets the job prove to crates.io which
+  # workflow of which repository it is, so no long-lived publish token has to exist
+  # anywhere. Without it the auth step below cannot mint a token and the release fails.
+  id-token: write
+
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-plz-release:
+    name: release-plz release
+    if: ${{ github.repository_owner == 'bitomule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      # Exchanges GitHub's OIDC token for a crates.io token that lives 30 minutes and is
+      # revoked when this job ends. Configured once on the crate's crates.io page against
+      # (bitomule/jevi, release-plz.yml) — so the name of THIS FILE is part of the
+      # credential. Renaming it breaks publishing until the config is updated to match.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release
+        env:
+          # A PAT, because a GITHUB_TOKEN-created tag cannot trigger the Release workflow
+          # that builds the binaries. Falls back so a fork still runs without one.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  release-plz-pr:
+    name: release-plz PR
+    if: ${{ github.repository_owner == 'bitomule' }}
+    runs-on: ubuntu-latest
+    needs: release-plz-release
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN || secrets.GITHUB_TOKEN }}

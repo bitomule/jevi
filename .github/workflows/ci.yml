@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Pin toolchain cargo ahead of Homebrew rustup-init (macOS workaround)
+        if: runner.os == 'macOS'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Pin toolchain cargo ahead of Homebrew rustup-init (macOS workaround)
+        if: runner.os == 'macOS'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+      # No network here on purpose. The integration tests point `base_url` at a closed
+      # port, which is what "the API is down" looks like from inside the binary — so CI
+      # exercises the degradation path every run without a key and without spending a cent.
+      - run: cargo test --locked
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Remove rust-toolchain override
+        run: rm -f rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo build --locked
+
+  never-exit-2:
+    name: a hook is never blocked
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      # The one contract worth its own job: Claude Code reads a hook's exit 2 as "block
+      # this tool call", so a mistyped flag must never produce one. clap's own default for
+      # an unknown flag IS 2, which is why this is checked against the real binary and not
+      # only in the test harness.
+      - name: a bad flag exits 5, never 2
+        run: |
+          set -u
+          echo hello | ./target/release/jevi ask "is this urgent" --nope >/dev/null 2>&1
+          code=$?
+          echo "exit code was $code"
+          test "$code" -eq 5
+      - name: --help exits 0
+        run: ./target/release/jevi --help >/dev/null

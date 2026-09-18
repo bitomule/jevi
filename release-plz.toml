@@ -1,0 +1,12 @@
+[workspace]
+# Group commits by Conventional Commits type in the generated changelog.
+changelog_update = true
+# Don't auto-bump pre-1.0 majors off a breaking-change marker — the maintainer decides
+# when a breaking minor ships.
+semver_check = false
+# Push the tag, but let cargo-dist create the GitHub Release with the binaries attached.
+# Enabling both creators fails the Release workflow with "a release with the same tag name
+# already exists".
+git_release_enable = false
+git_tag_enable = true
+publish = true
