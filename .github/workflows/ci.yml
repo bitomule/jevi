@@ -92,8 +92,11 @@ jobs:
       - name: a bad flag exits 5, never 2
         run: |
           set -u
-          echo hello | ./target/release/jevi ask "is this urgent" --nope >/dev/null 2>&1
-          code=$?
+          # GitHub runs steps as `bash -e`, so the non-zero exit we are HERE TO MEASURE
+          # kills the step before `$?` can be read. The `|| code=$?` is what keeps the
+          # failure ours to inspect instead of the shell's to act on.
+          code=0
+          echo hello | ./target/release/jevi ask "is this urgent" --nope >/dev/null 2>&1 || code=$?
           echo "exit code was $code"
           test "$code" -eq 5
       - name: --help exits 0
