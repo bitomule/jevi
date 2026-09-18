@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "model": "typesafe/jev-1.13",
+  "max_chars": 40000,
+  "questions": {
+    "needs_human": {
+      "type": "noul",
+      "instructions": "The agent has stopped and cannot continue until a person decides something, approves something, or does something only a person can do.",
+      "criteria": {
+        "true": "It asks a question, presents options to choose between, waits for approval, or needs a physical action such as unlocking a device or recording audio",
+        "false": "It reports finished work, or it is waiting on another agent, a build, or anything it can carry on past by itself"
+      },
+      "decide": {
+        "yes": 0.85,
+        "no": 0.5
+      },
+      "notes": "Thresholds are a placeholder until someone measures them. Measured elsewhere on 300 real tool results: the 0.2-0.5 band was claimed at 25-45% and was true 0% of the time, so anything under 0.5 is a no. Add a `validated` block once you have run your own labelled set; without one, every answer is marked `thresholds: default`."
+    },
+    "finished": {
+      "type": "noul",
+      "instructions": "The agent reports the work as finished and delivered.",
+      "criteria": {
+        "true": "It says the work is done, merged, shipped, or that a pull request is open",
+        "false": "Work is still in progress, blocked, or abandoned"
+      }
+    },
+    "went_wrong": {
+      "type": "noul",
+      "instructions": "The report contains something that went wrong and is not yet fixed.",
+      "criteria": {
+        "true": "A failure, a regression, a blocker, or a defect found and left open",
+        "false": "Everything described went well"
+      }
+    }
+  }
+}

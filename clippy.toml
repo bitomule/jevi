@@ -1,0 +1,3 @@
+# `expect` in a test is a legible assertion; in the binary it is a crash a hook would wear.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
