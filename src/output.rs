@@ -2,7 +2,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::decide::Outcome;
+use crate::decide::{Outcome, Source};
 
 /// One line per question. A single question drops the name, because a human asking one
 /// thing does not need it echoed back.
@@ -57,8 +57,22 @@ pub fn document(
         if let Some(w) = o.warning {
             entry.insert("warning".into(), json!(w));
         }
-        if o.defaulted {
-            entry.insert("thresholds".into(), json!("default"));
+        // Always, not only when defaulted. A row that says nothing about its cuts cannot be
+        // told apart from a row written by a version that did not record them, and the
+        // reader of a stored row is exactly who this field exists for.
+        entry.insert("thresholds".into(), json!(o.thresholds.source.as_str()));
+        if o.thresholds.source != Source::Default {
+            // Only the cuts that could have decided THIS verdict: a noul never consults
+            // min_confidence, and a choice or a score never consults yes/no. Printing the
+            // unused ones would invite somebody to believe they mattered.
+            entry.insert(
+                "cuts".into(),
+                if o.kind == "noul" {
+                    json!({ "yes": o.thresholds.yes, "no": o.thresholds.no })
+                } else {
+                    json!({ "min_confidence": o.thresholds.min_confidence })
+                },
+            );
         }
         answers.insert(name.clone(), Value::Object(entry));
     }
@@ -86,7 +100,16 @@ pub fn failure(kind: &str, message: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decide::Verdict;
+    use crate::decide::{Thresholds, Verdict};
+
+    fn shipped() -> Thresholds {
+        Thresholds {
+            source: Source::Default,
+            yes: 0.9,
+            no: 0.1,
+            min_confidence: 0.9,
+        }
+    }
 
     fn noul(p: f64, verdict: Verdict) -> Outcome {
         Outcome {
@@ -96,7 +119,7 @@ mod tests {
             number: Some(p),
             confidence: None,
             warning: None,
-            defaulted: false,
+            thresholds: shipped(),
         }
     }
 
@@ -126,9 +149,43 @@ mod tests {
 
     #[test]
     fn an_unvalidated_question_is_marked_in_the_document() {
-        let mut o = noul(0.99, Verdict::Yes);
-        o.defaulted = true;
+        let o = noul(0.99, Verdict::Yes);
         let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
         assert_eq!(doc["answers"]["a"]["thresholds"], "default");
+        // Nothing was moved, so there is nothing to disclose and no noise to add.
+        assert!(doc["answers"]["a"].get("cuts").is_none());
+    }
+
+    #[test]
+    fn a_hand_set_cut_is_disclosed_with_its_value() {
+        let mut o = noul(0.71, Verdict::Yes);
+        o.thresholds = Thresholds {
+            source: Source::Custom,
+            yes: 0.5,
+            ..shipped()
+        };
+        let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
+        assert_eq!(doc["answers"]["a"]["thresholds"], "custom");
+        assert_eq!(doc["answers"]["a"]["cuts"]["yes"], 0.5);
+    }
+
+    #[test]
+    fn a_choice_discloses_the_cut_that_could_have_decided_it_and_not_the_others() {
+        let o = Outcome {
+            kind: "choice".into(),
+            verdict: Verdict::Yes,
+            label: Some("bug".into()),
+            number: None,
+            confidence: Some(0.71),
+            warning: None,
+            thresholds: Thresholds {
+                source: Source::Custom,
+                min_confidence: 0.6,
+                ..shipped()
+            },
+        };
+        let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
+        assert_eq!(doc["answers"]["a"]["cuts"]["min_confidence"], 0.6);
+        assert!(doc["answers"]["a"]["cuts"].get("yes").is_none());
     }
 }

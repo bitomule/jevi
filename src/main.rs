@@ -35,6 +35,7 @@ fn main() {
     };
 
     let soft = matches!(&cli.command, Command::Ask(a) if a.soft);
+    jevi::set_quiet(soft);
 
     let code = match run(cli) {
         Ok(code) => code,
