@@ -94,9 +94,7 @@ fn ask(a: Ask) -> Result<i32> {
     let single = prepared.names.len() == 1 && a.set.is_none();
     let raw_state = read_state(&a)?;
 
-    // The cap is the question set's when it has one, because that is the length its
-    // thresholds were measured at.
-    let cap = a.max_chars.or(prepared.max_chars).unwrap_or(80_000);
+    let cap = resolve_cap(a.max_chars, prepared.max_chars);
     let built = build_state(&raw_state, a.state_json, cap)?;
 
     let opts = AskOptions {
@@ -160,6 +158,24 @@ fn ask(a: Ask) -> Result<i32> {
     } else {
         answered.outcomes[0].verdict.code()
     })
+}
+
+/// No cut unless somebody asked for one.
+///
+/// This used to default to 80,000 characters, which cut a big file down to its beginning and
+/// answered about that. Measured against what actually gets judged: across 1,225 real Swift
+/// and Rust source files the largest was 97 KiB — 25,018 tokens, 78% of the model's 32k
+/// window. Nothing in that corpus reached the window, so the cut protected against nothing
+/// and could only mislead, and it did exactly that until 0.1.3 made it announce itself.
+///
+/// What replaces it is the API's own refusal: past the window it answers HTTP 400
+/// `max_tokens_exceeded`, which jevi already maps to exit 5 and `state_too_large`. A loud
+/// refusal you can act on beats a quiet answer about half your input.
+///
+/// A flag still wins over a question set's `max_chars`, and a set's value is still the right
+/// place to pin one, because that is the length its thresholds were measured at.
+fn resolve_cap(flag: Option<usize>, from_set: Option<usize>) -> usize {
+    flag.or(from_set).unwrap_or(0)
 }
 
 fn read_state(a: &Ask) -> Result<String> {
@@ -337,6 +353,36 @@ fn write_private(path: &std::path::Path, body: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nothing_is_cut_unless_somebody_asked_for_it() {
+        // 0 is "no cut". This was 80_000, which answered about the beginning of any big file.
+        assert_eq!(resolve_cap(None, None), 0);
+    }
+
+    #[test]
+    fn a_question_set_can_still_pin_the_length_its_thresholds_were_measured_at() {
+        assert_eq!(resolve_cap(None, Some(40_000)), 40_000);
+    }
+
+    #[test]
+    fn the_flag_outranks_the_question_set_including_when_it_turns_the_cut_off() {
+        assert_eq!(resolve_cap(Some(500), Some(40_000)), 500);
+        assert_eq!(resolve_cap(Some(0), Some(40_000)), 0);
+    }
+
+    #[test]
+    fn the_default_cap_sends_a_state_that_used_to_be_cut_in_half() {
+        // The control that ties the constant to behaviour: 130_000 characters went through
+        // `build_state` at the old default and came back at 80_000 with 50_000 dropped.
+        let raw = "x".repeat(130_000);
+        let old = build_state(&raw, false, 80_000).expect("builds");
+        assert_eq!(old.dropped, 50_000);
+
+        let now = build_state(&raw, false, resolve_cap(None, None)).expect("builds");
+        assert_eq!(now.dropped, 0);
+        assert_eq!(now.chars, 130_000);
+    }
 
     #[test]
     fn a_long_string_state_is_truncated_and_says_so() {

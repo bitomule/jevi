@@ -101,7 +101,7 @@ pub struct Ask {
     #[arg(long, value_name = "P")]
     pub min_confidence: Option<f64>,
 
-    /// Truncate a string state to this many characters. 0 turns it off.
+    /// Truncate a string state to this many characters. 0, the default, sends it whole.
     #[arg(long, value_name = "N")]
     pub max_chars: Option<usize>,
 
