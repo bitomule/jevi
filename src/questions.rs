@@ -13,6 +13,27 @@ pub const DEFAULT_YES: f64 = 0.9;
 pub const DEFAULT_NO: f64 = 0.1;
 pub const DEFAULT_MIN_CONFIDENCE: f64 = 0.9;
 
+/// Advice printed to stderr: things that are legal, answered, and still worth knowing. It
+/// is separated from the warnings that report what actually happened to a call — a
+/// truncated state, a forced verdict — because those must never be silenceable, and these
+/// fire on ordinary correct usage and would otherwise spam anything calling jevi in a loop.
+fn note(msg: &str) {
+    if !QUIET.load(std::sync::atomic::Ordering::Relaxed)
+        && !std::env::var("JEVI_QUIET").is_ok_and(|v| !v.is_empty() && v != "0")
+    {
+        eprintln!("jevi: {msg}");
+    }
+}
+
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Silence the advisory notes for this process. `--soft` sets it, because soft mode's whole
+/// promise is that a hook calling jevi is never disturbed by it — the test that caught this
+/// asserts an empty stderr, and advice on stderr is still noise on stderr.
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// What the API actually refuses, measured against it: 255 options is accepted and 256
 /// comes back `Too many choices. Must have at most 255 choices.`
 const MAX_CHOICES: usize = 255;
@@ -41,10 +62,10 @@ fn check_choice_len(name: &str, len: usize) -> Result<()> {
         ));
     }
     if len > RECOMMENDED_CHOICES {
-        eprintln!(
-            "jevi: question `{name}` has {len} options; TypeSafe documents 2-{RECOMMENDED_CHOICES}. \
+        note(&format!(
+            "question `{name}` has {len} options; TypeSafe documents 2-{RECOMMENDED_CHOICES}. \
              It will answer, but validate that it still answers well at this width."
-        );
+        ));
     }
     Ok(())
 }
@@ -77,6 +98,11 @@ pub struct Decide {
     /// `None` means nobody has measured this question: the output says so rather than
     /// letting a default pass for a finding.
     pub validated: Option<Validated>,
+    /// True when a cut was supplied rather than inherited — a `--yes-at` on the command
+    /// line, or a key in a `decide` block. It is tracked rather than derived by comparing
+    /// against the shipped numbers so that a cut set by hand to the same value as the
+    /// default still reads as a cut somebody chose.
+    pub tuned: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -92,6 +118,7 @@ impl Default for Decide {
             no: DEFAULT_NO,
             min_confidence: DEFAULT_MIN_CONFIDENCE,
             validated: None,
+            tuned: false,
         }
     }
 }
@@ -169,13 +196,19 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
     // round trip and a 400.
     match kind {
         "noul" => {
-            if let Some(c) = obj.get("criteria") {
-                let c = c.as_object().ok_or_else(|| {
-                    bad("noul `criteria` must be an object with `true` and `false`".into())
-                })?;
-                if !c.contains_key("true") || !c.contains_key("false") {
-                    return Err(bad("noul `criteria` needs both `true` and `false`".into()));
+            match obj.get("criteria") {
+                Some(c) => {
+                    let c = c.as_object().ok_or_else(|| {
+                        bad("noul `criteria` must be an object with `true` and `false`".into())
+                    })?;
+                    if !c.contains_key("true") || !c.contains_key("false") {
+                        return Err(bad("noul `criteria` needs both `true` and `false`".into()));
+                    }
                 }
+                // Legal, and answered, and the single cheapest thing you can do to this
+                // question to make it harder to steer. The API allows it, so jevi allows
+                // it; staying silent about it is what it had no business doing.
+                None => note(&missing_criteria(name)),
             }
         }
         "choice" => {
@@ -210,6 +243,18 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
     Ok((wire, decide))
 }
 
+/// Measured against this API, not asserted: over 60 paired runs of the same question with
+/// an instruction planted in the state, the verdict flipped 10 times with no `criteria` and
+/// 1 time with them. That is the whole reason this note exists.
+fn missing_criteria(name: &str) -> String {
+    format!(
+        "question `{name}` is a noul with no `criteria`; it will be answered, but a state \
+         carrying its own instructions flips the verdict far more often without them. Give \
+         `criteria` a `true` and a `false` saying what each verdict means. Set JEVI_QUIET=1 \
+         to silence this."
+    )
+}
+
 fn parse_decide(name: &str, raw: Option<&Value>) -> Result<Decide> {
     let bad = |m: String| Error::invalid("question_file", format!("question `{name}`: {m}"));
     let Some(raw) = raw else {
@@ -234,6 +279,10 @@ fn parse_decide(name: &str, raw: Option<&Value>) -> Result<Decide> {
         }
     };
 
+    let tuned = ["yes", "no", "min_confidence"]
+        .iter()
+        .any(|k| obj.contains_key(*k));
+
     let yes = num("yes", DEFAULT_YES)?;
     let no = num("no", DEFAULT_NO)?;
     if no > yes {
@@ -256,6 +305,7 @@ fn parse_decide(name: &str, raw: Option<&Value>) -> Result<Decide> {
         no,
         min_confidence,
         validated,
+        tuned,
     })
 }
 
@@ -308,19 +358,17 @@ pub fn shorthand(
         }
         (None, None) => {
             q.insert("type".into(), Value::String("noul".into()));
+            note(&missing_criteria("answer"));
         }
     }
 
-    let mut decide = Decide::default();
-    if let Some(v) = yes_at {
-        decide.yes = v;
-    }
-    if let Some(v) = no_at {
-        decide.no = v;
-    }
-    if let Some(v) = min_confidence {
-        decide.min_confidence = v;
-    }
+    let decide = Decide {
+        yes: yes_at.unwrap_or(DEFAULT_YES),
+        no: no_at.unwrap_or(DEFAULT_NO),
+        min_confidence: min_confidence.unwrap_or(DEFAULT_MIN_CONFIDENCE),
+        validated: None,
+        tuned: yes_at.is_some() || no_at.is_some() || min_confidence.is_some(),
+    };
     if decide.no > decide.yes {
         return Err(Error::invalid("flags", "--no-at is above --yes-at"));
     }

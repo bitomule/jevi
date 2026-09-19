@@ -39,6 +39,7 @@ fn run(args: &[&str], stdin: &str) -> std::process::Output {
         .env_remove("TYPESAFE_API_KEY")
         .env_remove("JEVI_API_KEY")
         .env_remove("JEVI_DISABLE")
+        .env_remove("JEVI_QUIET")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -160,4 +161,81 @@ fn doctor_reports_without_a_key_instead_of_failing() {
     let out = run(&["doctor"], "");
     assert_eq!(code(&out), 0);
     assert!(String::from_utf8_lossy(&out.stdout).contains("key:"));
+}
+
+/// The criteria note, and the control that proves it is not simply always on.
+///
+/// A `noul` with no `criteria` stays legal — the API takes it, so jevi takes it — but a
+/// state carrying its own instructions flips the verdict far more often without them, and
+/// saying nothing about that was the defect. These run offline: the note is written while
+/// the question is prepared, before anything is sent.
+mod criteria_note {
+    use super::*;
+
+    fn stderr_of(args: &[&str], env: &[(&str, &str)]) -> String {
+        let mut cmd = Command::cargo_bin("jevi").expect("binary is built");
+        cmd.args(args)
+            .env("JEVI_CONFIG", offline_config())
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("TYPESAFE_API_KEY")
+            .env_remove("JEVI_API_KEY")
+            .env_remove("JEVI_DISABLE")
+            .env_remove("JEVI_QUIET")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().expect("spawns");
+        let _ = child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"the server is down");
+        let out = child.wait_with_output().expect("runs");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    }
+
+    #[test]
+    fn a_noul_without_criteria_is_answered_but_says_so() {
+        let err = stderr_of(&["ask", "is this urgent", "--timeout", "1200"], &[]);
+        assert!(
+            err.contains("no `criteria`"),
+            "expected the note, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_question_that_already_has_criteria_gets_no_note() {
+        // The control. `--options` builds a choice whose options ARE its criteria, so if
+        // this ever prints the note, the note fires on everything and means nothing.
+        let err = stderr_of(
+            &[
+                "ask",
+                "how urgent",
+                "--options",
+                "low,high",
+                "--timeout",
+                "1200",
+            ],
+            &[],
+        );
+        assert!(
+            !err.contains("no `criteria`"),
+            "the note fired on a question that has criteria: {err}"
+        );
+    }
+
+    #[test]
+    fn the_note_can_be_silenced_for_a_caller_that_runs_in_a_loop() {
+        let err = stderr_of(
+            &["ask", "is this urgent", "--timeout", "1200"],
+            &[("JEVI_QUIET", "1")],
+        );
+        assert!(
+            !err.contains("no `criteria`"),
+            "JEVI_QUIET was ignored: {err}"
+        );
+    }
 }

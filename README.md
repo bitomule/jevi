@@ -119,9 +119,33 @@ $ cat huge.log | jevi ask -f triage
 needs_human	unsure	0.99	!length_mismatch
 ```
 
-A question with no `validated` block still works on the shipped defaults (0.9 / 0.1), and
-every answer is marked `thresholds: default` so a default is never mistaken for a finding.
-Those defaults are deliberately too conservative for real traffic. Go and measure.
+A question with no `validated` block still works on the shipped defaults (0.9 / 0.1). Those
+defaults are deliberately too conservative for real traffic. Go and measure.
+
+**Every answer says where its cuts came from**, because a verdict is meaningless without
+them. `thresholds` is one of three words:
+
+| | what it means |
+|---|---|
+| `default` | nothing was supplied and nothing was measured: the numbers jevi ships |
+| `custom` | a cut was chosen by hand — a flag, or a key in `decide` — with no measurement recorded behind it |
+| `validated` | the question carries a `validated` block naming what the cuts were measured against |
+
+When it is not `default`, the answer also carries `cuts` with the numbers that could have
+decided *that* verdict — `yes`/`no` for a noul, `min_confidence` for a choice or a score.
+
+```console
+$ jevi ask "is this release a success?" --text "$mixed" --json
+{"answers":{"answer":{"p":0.7,"thresholds":"default","verdict":"unsure", ...}}}
+
+$ jevi ask "is this release a success?" --text "$mixed" --json --yes-at 0.5
+{"answers":{"answer":{"p":0.7,"thresholds":"custom","cuts":{"yes":0.5,"no":0.1},
+                      "verdict":"yes", ...}}}
+```
+
+Same input, same probability, opposite verdict. Until 0.1.4 both of those said
+`"thresholds": "default"`, so a stored row could not be told apart from one decided on the
+shipped cuts — which is the one thing whoever reads that row later needs to know.
 
 **Pin the model id at the precision you actually mean.** The API answers with a dated build
 — you ask for `typesafe/jev-1.13` and it replies `typesafe/jev-1.13-20260917`. The check is
@@ -177,6 +201,29 @@ word "exactly" was added to it, and then went unsure 3/3 — because the real la
 "Larger Text, No" and "exactly" quietly turned a question about content into one about the
 literal string, which carries the switch's value. **Wording moves the answer even when the
 fact does not.**
+
+### Give every question criteria
+
+`criteria` is optional on a `noul` — the API takes the question without it, so jevi takes it
+too. It is still the cheapest thing you can do to a question, and since 0.1.4 leaving it out
+gets you a line on stderr saying so:
+
+```console
+$ jevi ask "is this urgent" --text "$msg"
+jevi: question `answer` is a noul with no `criteria`; it will be answered, but a state
+      carrying its own instructions flips the verdict far more often without them. ...
+```
+
+The measurement behind that note: over 60 paired runs of the same question with an
+instruction planted inside the state, the verdict flipped **10 times with no `criteria` and
+1 time with them**. Saying what `true` and `false` each mean gives the model something to
+check the state against instead of only the state's own words.
+
+It is advice, not a refusal, and `JEVI_QUIET=1` silences it — along with the "more options
+than documented" note — for anything calling jevi in a loop. `--soft` silences it too,
+because soft mode's promise is that a hook is never disturbed. Neither silences the report
+that a state was **truncated**: that one says what happened to your call, not what you might
+want to do differently, and it is never optional.
 
 ### Tell it what changed, not what you tried
 

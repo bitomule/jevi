@@ -47,10 +47,10 @@ use std::time::Instant;
 use serde_json::Value;
 
 pub use crate::config::{config_dir, config_path, Config};
-pub use crate::decide::{Outcome, Verdict};
+pub use crate::decide::{Outcome, Source, Thresholds, Verdict};
 pub use crate::error::{Error, Result};
 pub use crate::provider::Provider;
-pub use crate::questions::{Decide, Prepared, QuestionSet, Validated};
+pub use crate::questions::{set_quiet, Decide, Prepared, QuestionSet, Validated};
 
 /// Everything one call came back with. `outcomes` lines up with `names` by position.
 #[derive(Debug)]

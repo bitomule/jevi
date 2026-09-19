@@ -53,8 +53,60 @@ pub struct Outcome {
     pub confidence: Option<f64>,
     /// Set when the verdict was forced rather than measured.
     pub warning: Option<&'static str>,
-    /// True when nobody has validated this question's thresholds.
-    pub defaulted: bool,
+    /// Where the cuts that produced this verdict came from, and what they were.
+    pub thresholds: Thresholds,
+}
+
+/// The cuts this verdict was read off, and who chose them.
+///
+/// This exists because saying only "default" was a lie by omission: the same answer at
+/// p=0.71 comes back `yes` under `--yes-at 0.5` and `unsure` without it, and the document
+/// used to claim `"thresholds": "default"` in both cases. Whoever reads a stored row later
+/// is the one person who cannot tell the difference, and they are who the record is for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Thresholds {
+    pub source: Source,
+    pub yes: f64,
+    pub no: f64,
+    pub min_confidence: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Nothing was supplied and nothing was measured: the numbers jevi ships.
+    Default,
+    /// A cut was chosen by hand — a flag, or a key in a `decide` block — with no recorded
+    /// measurement behind it.
+    Custom,
+    /// The question carries a `validated` block naming what the cuts were measured against.
+    Validated,
+}
+
+impl Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Source::Default => "default",
+            Source::Custom => "custom",
+            Source::Validated => "validated",
+        }
+    }
+}
+
+impl Thresholds {
+    fn of(decide: &Decide) -> Self {
+        Thresholds {
+            source: if decide.validated.is_some() {
+                Source::Validated
+            } else if decide.tuned {
+                Source::Custom
+            } else {
+                Source::Default
+            },
+            yes: decide.yes,
+            no: decide.no,
+            min_confidence: decide.min_confidence,
+        }
+    }
 }
 
 /// The facts a threshold was validated against, as they stand for *this* call.
@@ -90,7 +142,7 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
         .unwrap_or("unknown")
         .to_owned();
     let warning = provenance_warning(decide, provenance);
-    let defaulted = decide.validated.is_none();
+    let thresholds = Thresholds::of(decide);
 
     let mut out = match kind.as_str() {
         "noul" => match answer.get("noul").and_then(Value::as_f64) {
@@ -107,9 +159,9 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
                 number: Some(p),
                 confidence: None,
                 warning: None,
-                defaulted,
+                thresholds,
             },
-            None => missing(kind, defaulted),
+            None => missing(kind, thresholds),
         },
         "choice" => {
             let label = answer
@@ -129,7 +181,7 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
                     number: None,
                     confidence: Some(c),
                     warning: None,
-                    defaulted,
+                    thresholds,
                 },
                 // A shape we half understand degrades to "I don't know" rather than
                 // failing the whole call: this is exactly what a provider change looks
@@ -141,7 +193,7 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
                     number: None,
                     confidence,
                     warning: Some("incomplete_answer"),
-                    defaulted,
+                    thresholds,
                 },
             }
         }
@@ -174,13 +226,13 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
                         number: Some(score),
                         confidence,
                         warning: None,
-                        defaulted,
+                        thresholds,
                     }
                 }
-                None => missing(kind, defaulted),
+                None => missing(kind, thresholds),
             }
         }
-        _ => missing(kind, defaulted),
+        _ => missing(kind, thresholds),
     };
 
     if let Some(w) = warning {
@@ -190,7 +242,7 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
     out
 }
 
-fn missing(kind: String, defaulted: bool) -> Outcome {
+fn missing(kind: String, thresholds: Thresholds) -> Outcome {
     Outcome {
         kind,
         verdict: Verdict::Unsure,
@@ -198,7 +250,7 @@ fn missing(kind: String, defaulted: bool) -> Outcome {
         number: None,
         confidence: None,
         warning: Some("incomplete_answer"),
-        defaulted,
+        thresholds,
     }
 }
 
@@ -339,6 +391,43 @@ mod tests {
             &Decide::default(),
             &no_provenance(),
         );
-        assert!(out.defaulted);
+        assert_eq!(out.thresholds.source, Source::Default);
+    }
+
+    #[test]
+    fn a_cut_moved_by_hand_is_custom_and_not_default() {
+        // The exact case that made the record a lie: p=0.71 is `yes` under a hand-set cut of
+        // 0.5 and `unsure` under the shipped 0.9, and both used to record "default".
+        let answer = json!({"type":"noul","noul":0.71});
+        let tuned = Decide {
+            yes: 0.5,
+            tuned: true,
+            ..Decide::default()
+        };
+
+        let out = outcome(&answer, &tuned, &no_provenance());
+        assert_eq!(out.verdict, Verdict::Yes);
+        assert_eq!(out.thresholds.source, Source::Custom);
+        assert_eq!(out.thresholds.yes, 0.5);
+
+        let out = outcome(&answer, &Decide::default(), &no_provenance());
+        assert_eq!(out.verdict, Verdict::Unsure);
+        assert_eq!(out.thresholds.source, Source::Default);
+    }
+
+    #[test]
+    fn a_validated_block_outranks_a_hand_set_cut() {
+        let d = Decide {
+            yes: 0.8,
+            tuned: true,
+            validated: Some(Validated {
+                model: None,
+                max_chars: None,
+            }),
+            ..Decide::default()
+        };
+        let out = outcome(&json!({"type":"noul","noul":0.99}), &d, &no_provenance());
+        assert_eq!(out.thresholds.source, Source::Validated);
+        assert_eq!(out.thresholds.yes, 0.8);
     }
 }
