@@ -344,33 +344,34 @@ The family of question that sounds like taste — "does this use the word the pl
 use?" — turns out to be a glossary, which is to say code: a list of banned terms finds those
 cases in milliseconds and jev cannot find them at all.
 
-## Long input: it is cut, and it says so
+## Long input: nothing is cut unless you ask
 
-Jev's window is 32k tokens and the API refuses anything past it with a loud HTTP 400. But
-`jevi` does not let you get that far: it cuts a string state to **80,000 characters** first,
-so a big file is judged on its beginning.
+Jev's window is 32k tokens and the API refuses anything past it with a loud HTTP 400, which
+`jevi` reports as exit 5 and `state_too_large`. **That refusal is what you get**, because
+there is no cut by default.
 
-That default exists to turn a refusal into an answer, and it is defensible — but it was
-silent until 0.1.3, and a silent cut is the exact failure this tool is built to avoid. An
-answer about the first half of a file looks identical to an answer about all of it.
+Until 0.1.4 a string state was cut to 80,000 characters first, so a big file was judged on
+its beginning. That default was there to turn a refusal into an answer, and it was a bad
+trade: across 1,225 real Swift and Rust source files the largest was 97 KiB — 25,018 tokens,
+**78% of the window**. Nothing in that corpus came close to the limit, so the cut protected
+against nothing and could only mislead. It was also silent until 0.1.3, and an answer about
+the first half of a file looks exactly like an answer about all of it.
 
-Now it is reported in both directions, and never only inside the text the model reads:
+A loud refusal you can act on beats a quiet answer about part of your input.
+
+**You can still ask for a cut**, and then it reports itself in both directions, never only
+inside the text the model reads:
 
 ```console
-$ jevi ask "does this handle the error case" --state big.swift --json
+$ jevi ask "does this handle the error case" --state big.swift --json --max-chars 80000
 {"ok":true, ..., "truncated":{"kept_chars":80000,"dropped_chars":100001}}
 jevi: the state was cut to 80000 characters and 100001 were dropped — this answer is
       about part of the input. Raise --max-chars, or pass 0 to send it whole.
 ```
 
-`--max-chars 0` turns the cut off entirely and lets the API decide; `--max-chars N` moves it.
-A question set can pin its own `max_chars`, and should, because that is the length its
-thresholds were measured at.
-
-For a sense of scale: across 1,225 real Swift and Rust source files, the largest was 97 KiB
-and came to 25,018 tokens — 78% of the window. So on a codebase this cut protects from
-nothing and can only mislead you; set it to 0 and let the 400 tell you when something is
-genuinely too big.
+`--max-chars N` sets the cut, `--max-chars 0` is the default and means no cut. A question set
+can pin its own `max_chars`, and should, because that is the length its thresholds were
+measured at; the flag outranks the set.
 
 ## What this is not
 
