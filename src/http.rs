@@ -135,18 +135,49 @@ mod tests {
         let addr = listener.local_addr().expect("has an address");
 
         let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
             let (mut socket, _) = listener.accept().expect("accepts");
-            // Read just enough of the request that the client is not writing into a closed
-            // socket when the reply lands.
-            let mut buf = [0u8; 1024];
-            let _ = std::io::Read::read(&mut socket, &mut buf);
+
+            // The whole request has to be consumed before replying. A single short read
+            // leaves the client's body sitting in the receive buffer, and closing a socket
+            // with unread data sends RST rather than FIN — on macOS the client then loses
+            // the response and reports a connection error, which `post` classifies as
+            // retryable and retries into a listener that is already gone. It read as
+            // `connect` instead of `state_too_large`, and only on macOS.
+            let mut req = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let n = match socket.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req);
+                let Some(head_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let want: usize = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                if req.len() >= head_end + 4 + want {
+                    break;
+                }
+            }
+
             let body = r#"{"detail":{"error_type":"max_tokens_exceeded"}}"#;
             let reply = format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            let _ = std::io::Write::write_all(&mut socket, reply.as_bytes());
+            let _ = socket.write_all(reply.as_bytes());
+            let _ = socket.flush();
+            let _ = socket.shutdown(std::net::Shutdown::Write);
         });
 
         let e = post(
