@@ -44,6 +44,13 @@ pub fn post(url: &str, key: &str, body: &Value, timeout_ms: u64) -> Result<Value
 fn try_once(url: &str, key: &str, body: &Value, budget: Duration) -> Result<Value> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(budget))
+        // Without this, ureq turns a 4xx into `Error::StatusCode(code)` — a code and nothing
+        // else. The body is the only place the API says *why* it refused, so throwing it
+        // away made `status_error`'s `max_tokens_exceeded` branch unreachable: it matches on
+        // a detail string that nothing could ever supply. Sending a state past the window
+        // came back as a bare `bad_request` with an empty message instead of the
+        // `state_too_large` this crate documents.
+        .http_status_as_error(false)
         .build()
         .into();
 
@@ -54,10 +61,17 @@ fn try_once(url: &str, key: &str, body: &Value, budget: Duration) -> Result<Valu
         .send_json(body);
 
     match response {
-        Ok(mut r) => r
+        Ok(mut r) if r.status().is_success() => r
             .body_mut()
             .read_json::<Value>()
             .map_err(|e| Error::no_answer("truncated", e.to_string())),
+        Ok(mut r) => {
+            let code = r.status().as_u16();
+            let detail = r.body_mut().read_to_string().unwrap_or_default();
+            Err(status_error(code, Some(&detail)))
+        }
+        // Kept for the case where the status still arrives as an error, so a future ureq
+        // change degrades to the old behaviour rather than to a panic.
         Err(ureq::Error::StatusCode(code)) => Err(status_error(code, None)),
         Err(e) => {
             let text = e.to_string();
@@ -106,6 +120,77 @@ mod tests {
         );
         assert_eq!(e.code(), 5);
         assert_eq!(e.kind(), "state_too_large");
+    }
+
+    /// The test above passes whether or not anything ever reaches `status_error` with a
+    /// body — it hands one over itself. It did pass, for every version up to 0.2.0, while
+    /// the branch it checks was unreachable in production: the agent turned a 4xx into a
+    /// bare status code and the body, the only place the API says *why*, was dropped. A
+    /// state past the window came back as `bad_request` with an empty message.
+    ///
+    /// So this one goes through `post` against a real socket, which is the path that broke.
+    #[test]
+    fn the_reason_for_a_refusal_survives_the_trip_through_post() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("has an address");
+
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut socket, _) = listener.accept().expect("accepts");
+
+            // The whole request has to be consumed before replying. A single short read
+            // leaves the client's body sitting in the receive buffer, and closing a socket
+            // with unread data sends RST rather than FIN — on macOS the client then loses
+            // the response and reports a connection error, which `post` classifies as
+            // retryable and retries into a listener that is already gone. It read as
+            // `connect` instead of `state_too_large`, and only on macOS.
+            let mut req = Vec::new();
+            let mut buf = [0u8; 512];
+            loop {
+                let n = match socket.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                req.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&req);
+                let Some(head_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let want: usize = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                if req.len() >= head_end + 4 + want {
+                    break;
+                }
+            }
+
+            let body = r#"{"detail":{"error_type":"max_tokens_exceeded"}}"#;
+            let reply = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(reply.as_bytes());
+            let _ = socket.flush();
+            let _ = socket.shutdown(std::net::Shutdown::Write);
+        });
+
+        let e = post(
+            &format!("http://{addr}/decisions"),
+            "test",
+            &serde_json::json!({"state":"x"}),
+            4000,
+        )
+        .expect_err("a 400 is not an answer");
+
+        assert_eq!(e.kind(), "state_too_large");
+        assert_eq!(e.code(), 5);
+        let _ = server.join();
     }
 
     #[test]
