@@ -11,6 +11,24 @@
 //! between the cuts *you* validated for *this* question. A noul returns no confidence, and
 //! the vendor's own documentation says 0.5 does not mean uncertain, so nothing here
 //! synthesises a confidence for one.
+//!
+//! **All of that is about a noul, and only a noul.** A `choice` and a `score` are asked a
+//! different question — *which one*, *how much* — and their answer is the option and the
+//! number, not a yes. Until 0.2.1 both also carried a yes/unsure read off a confidence cut,
+//! and it cost correct answers: on one screen the right row was chosen 5/5 at confidence
+//! 0.62-0.84, every one of them reported `unsure` under the shipped 0.9, and the caller
+//! reading the verdict threw all five away. Measured against the other side, five
+//! deliberate abstentions on the same screen scored 0.50-0.56 — overlapping, not separated
+//! — and a run elsewhere put correct answers from 0.76 and wrong ones up to 0.88. There is
+//! no cut, so jevi stopped imposing one and hands over the service's own per-option
+//! probabilities instead.
+//!
+//! What has to keep arriving is the model declining to pick, and that is worth being exact
+//! about: **the service never abstains on its own.** Asked to choose among four options
+//! none of which fit, it returned one anyway, 3/3, at confidence 0.34-0.47. An abstention
+//! exists only if the question offers it as an option — a "none" — and then it arrives as
+//! that label, which is where it belonged all along. A `choice` therefore goes `unsure`
+//! only when no option came back at all, which is a malformed answer and says so.
 
 use serde_json::Value;
 
@@ -51,8 +69,13 @@ pub struct Outcome {
     /// The noul probability, or the score.
     pub number: Option<f64>,
     pub confidence: Option<f64>,
-    /// Set when the verdict was forced rather than measured.
+    /// Set when the verdict was forced rather than measured, or when the answer fell below
+    /// a confidence the caller named. A warning never decides a choice or a score.
     pub warning: Option<&'static str>,
+    /// The service's own probability per option, passed through untouched. This is the
+    /// material for a caller that wants its own cut, and it is the provider's number rather
+    /// than one jevi invented — which is the whole difference.
+    pub probabilities: Option<Value>,
     /// Where the cuts that produced this verdict came from, and what they were.
     pub thresholds: Thresholds,
 }
@@ -69,6 +92,10 @@ pub struct Thresholds {
     pub yes: f64,
     pub no: f64,
     pub min_confidence: f64,
+    /// Whether `min_confidence` was named by the caller. On a choice or a score it decides
+    /// nothing any more, so a record that printed it unconditionally would be claiming a
+    /// cut had been consulted when none was.
+    pub min_confidence_set: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +132,7 @@ impl Thresholds {
             yes: decide.yes,
             no: decide.no,
             min_confidence: decide.min_confidence,
+            min_confidence_set: decide.min_confidence_set,
         }
     }
 }
@@ -135,6 +163,16 @@ fn provenance_warning(decide: &Decide, p: &Provenance<'_>) -> Option<&'static st
     None
 }
 
+/// A confidence below the cut the caller named is worth saying, and worth nothing more.
+/// It is advice printed next to a real answer, never a verdict replacing one: measured on
+/// one screen, five correct choices scored 0.62-0.84 and five deliberate abstentions scored
+/// 0.50-0.56, and a sixth measurement elsewhere put correct answers from 0.76 and wrong ones
+/// up to 0.88. The two populations overlap, so no cut separates them.
+fn low_confidence(confidence: Option<f64>, decide: &Decide) -> Option<&'static str> {
+    let c = confidence?;
+    (decide.min_confidence_set && c < decide.min_confidence).then_some("low_confidence")
+}
+
 pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> Outcome {
     let kind = answer
         .get("type")
@@ -159,6 +197,7 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
                 number: Some(p),
                 confidence: None,
                 warning: None,
+                probabilities: None,
                 thresholds,
             },
             None => missing(kind, thresholds),
@@ -169,30 +208,30 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             let confidence = answer.get("confidence").and_then(Value::as_f64);
-            match (label, confidence) {
-                (Some(label), Some(c)) => Outcome {
+            match label {
+                Some(label) => Outcome {
                     kind,
-                    verdict: if c >= decide.min_confidence {
-                        Verdict::Yes
-                    } else {
-                        Verdict::Unsure
-                    },
+                    // The chosen option IS the answer. See the note on `low_confidence`.
+                    verdict: Verdict::Yes,
                     label: Some(label),
                     number: None,
-                    confidence: Some(c),
-                    warning: None,
+                    confidence,
+                    warning: low_confidence(confidence, decide),
+                    probabilities: answer.get("probabilities").cloned(),
                     thresholds,
                 },
                 // A shape we half understand degrades to "I don't know" rather than
                 // failing the whole call: this is exactly what a provider change looks
-                // like from in here.
-                (label, confidence) => Outcome {
+                // like from in here. It is also the only way a choice can carry no
+                // answer, because the service always picks one — see the module note.
+                None => Outcome {
                     kind,
                     verdict: Verdict::Unsure,
-                    label,
+                    label: None,
                     number: None,
                     confidence,
                     warning: Some("incomplete_answer"),
+                    probabilities: answer.get("probabilities").cloned(),
                     thresholds,
                 },
             }
@@ -207,25 +246,15 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
                         .and_then(|l| l.get(score.round().max(0.0).to_string()))
                         .and_then(Value::as_str)
                         .map(str::to_owned);
-                    // A score is a continuous estimate; its consumer usually wants the
-                    // number, so there is no confidence gate unless one was asked for.
-                    let gated = decide.min_confidence < crate::questions::DEFAULT_MIN_CONFIDENCE
-                        || decide.validated.is_some();
-                    let unsure = gated
-                        && confidence
-                            .map(|c| c < decide.min_confidence)
-                            .unwrap_or(false);
                     Outcome {
                         kind,
-                        verdict: if unsure {
-                            Verdict::Unsure
-                        } else {
-                            Verdict::Yes
-                        },
+                        // The score IS the answer, exactly as the chosen option is.
+                        verdict: Verdict::Yes,
                         label,
                         number: Some(score),
                         confidence,
-                        warning: None,
+                        warning: low_confidence(confidence, decide),
+                        probabilities: answer.get("probabilities").cloned(),
                         thresholds,
                     }
                 }
@@ -250,6 +279,7 @@ fn missing(kind: String, thresholds: Thresholds) -> Outcome {
         number: None,
         confidence: None,
         warning: Some("incomplete_answer"),
+        probabilities: None,
         thresholds,
     }
 }
@@ -291,9 +321,28 @@ mod tests {
     }
 
     #[test]
-    fn a_choice_below_its_confidence_is_unsure_but_keeps_the_label() {
+    fn a_correct_choice_under_the_shipped_confidence_is_still_the_answer() {
+        // The defect this replaces, with the real case that found it: an agent asked which
+        // row of a screen led to the device information, jev picked the right one 5/5 at
+        // 0.62-0.84, jevi called every one `unsure` against the shipped 0.9, and the agent
+        // read the verdict and threw a correct answer away. The label was there all along.
+        let out = outcome(
+            &json!({"type":"choice","choice":"Acerca de","confidence":0.62}),
+            &Decide::default(),
+            &no_provenance(),
+        );
+        assert_eq!(out.verdict, Verdict::Yes);
+        assert_eq!(out.label.as_deref(), Some("Acerca de"));
+        assert_eq!(out.confidence, Some(0.62));
+        assert!(out.warning.is_none());
+    }
+
+    #[test]
+    fn a_confidence_the_caller_named_is_reported_and_decides_nothing() {
         let d = Decide {
             min_confidence: 0.9,
+            min_confidence_set: true,
+            tuned: true,
             ..Decide::default()
         };
         let out = outcome(
@@ -301,8 +350,75 @@ mod tests {
             &d,
             &no_provenance(),
         );
+        assert_eq!(out.verdict, Verdict::Yes);
+        assert_eq!(out.warning, Some("low_confidence"));
+    }
+
+    #[test]
+    fn a_confidence_nobody_named_produces_no_advice_either() {
+        let out = outcome(
+            &json!({"type":"choice","choice":"bug","confidence":0.11}),
+            &Decide::default(),
+            &no_provenance(),
+        );
+        assert!(out.warning.is_none());
+    }
+
+    #[test]
+    fn the_models_abstention_arrives_as_the_option_it_was_offered() {
+        // Measured against the live service: asked to choose among options none of which
+        // fit, it returns one anyway, 3/3 at 0.34-0.47 — it never abstains on its own. So
+        // an abstention exists only as an option the question offers, and it has to reach
+        // the caller as that option and not as a verdict jevi computed.
+        let out = outcome(
+            &json!({"type":"choice","choice":"ninguno","confidence":0.52}),
+            &Decide::default(),
+            &no_provenance(),
+        );
+        assert_eq!(out.label.as_deref(), Some("ninguno"));
+        assert_eq!(out.verdict, Verdict::Yes);
+    }
+
+    #[test]
+    fn a_choice_with_no_option_at_all_is_the_one_thing_left_that_is_unsure() {
+        let out = outcome(
+            &json!({"type":"choice","confidence":0.9}),
+            &Decide::default(),
+            &no_provenance(),
+        );
         assert_eq!(out.verdict, Verdict::Unsure);
-        assert_eq!(out.label.as_deref(), Some("bug"));
+        assert_eq!(out.warning, Some("incomplete_answer"));
+    }
+
+    #[test]
+    fn a_score_is_not_gated_by_a_confidence_either() {
+        // Same defect, same shape: `--levels` asks how much, and the number is the answer.
+        let d = Decide {
+            min_confidence: 0.9,
+            min_confidence_set: true,
+            tuned: true,
+            validated: Some(Validated::default()),
+            ..Decide::default()
+        };
+        let out = outcome(
+            &json!({"type":"score","score":2.0,"confidence":0.4}),
+            &d,
+            &no_provenance(),
+        );
+        assert_eq!(out.verdict, Verdict::Yes);
+        assert_eq!(out.number, Some(2.0));
+        assert_eq!(out.warning, Some("low_confidence"));
+    }
+
+    #[test]
+    fn the_per_option_probabilities_are_passed_through_untouched() {
+        let out = outcome(
+            &json!({"type":"choice","choice":"bug","confidence":0.6,
+                    "probabilities":{"bug":0.6,"feature":0.4}}),
+            &Decide::default(),
+            &no_provenance(),
+        );
+        assert_eq!(out.probabilities.expect("passed through")["bug"], 0.6);
     }
 
     #[test]

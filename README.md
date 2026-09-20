@@ -79,6 +79,19 @@ knows".
 validated for *this* question. A `noul` returns no confidence at all, and TypeSafe's docs
 are explicit that 0.5 does not mean uncertain — so `jevi` never invents one.
 
+**And all of that is about a `noul`, and only a `noul`.** A `--options` question asks *which
+one* and a `--levels` question asks *how much*; the answer is the option and the number. Up
+to 0.2.1 both also carried a yes/unsure read off a confidence cut, and that cut threw correct
+answers away. The case that found it: an agent asked which row of a screen led to the device
+information, jev picked the right one 5/5 at confidence 0.62–0.84, `jevi` called every one
+`unsure` against its shipped 0.9, and the agent — which read the verdict — discarded five
+correct answers and stopped navigating.
+
+So a choice or a score now always exits **0** with the answer in it. Read the label, not a
+verdict. `--min-confidence` still works and is now advice: it adds `!low_confidence` next to
+the answer and decides nothing. If you want your own cut, the answer carries the service's
+own `probabilities` per option — its numbers, not one `jevi` invented.
+
 **Exit 2 is reserved and never emitted**, including for a mistyped flag. Claude Code reads a
 hook's exit 2 as "block this tool call", and a typo must not become a block.
 
@@ -131,8 +144,10 @@ them. `thresholds` is one of three words:
 | `custom` | a cut was chosen by hand — a flag, or a key in `decide` — with no measurement recorded behind it |
 | `validated` | the question carries a `validated` block naming what the cuts were measured against |
 
-When it is not `default`, the answer also carries `cuts` with the numbers that could have
-decided *that* verdict — `yes`/`no` for a noul, `min_confidence` for a choice or a score.
+When it is not `default`, a noul's answer also carries `cuts` with the `yes`/`no` that
+decided it. A choice or a score carries `cuts` only when you named a `min_confidence`, and
+then as `advisory_min_confidence` — because on those it decided nothing, and printing a
+number that was never consulted is the same lie by omission this field exists to close.
 
 ```console
 $ jevi ask "is this release a success?" --text "$mixed" --json
@@ -224,6 +239,27 @@ than documented" note — for anything calling jevi in a loop. `--soft` silences
 because soft mode's promise is that a hook is never disturbed. Neither silences the report
 that a state was **truncated**: that one says what happened to your call, not what you might
 want to do differently, and it is never optional.
+
+### A choice question must offer a way out, because the service never takes one
+
+Measured against the live endpoint: asked to choose among four options, none of which
+answered the question, it returned one anyway — 3/3, at confidence 0.34–0.47. There is no
+`choice: null` and there is no abstention field. **If your options do not include one that
+means "none of these", the model has no way to tell you it does not know, and you will read
+a confident-looking answer to a question it could not answer.**
+
+So put the escape hatch in the list, and it comes back as an ordinary label:
+
+```console
+$ jevi ask "which row leads to the goal" --options "Cuenta,Apariencia,Acerca de,ninguno" ...
+ninguno	0.53
+```
+
+That is the abstention, and it survives precisely because it is the answer rather than a
+verdict computed from a number. Measured on one screen, the correct row scored 0.62–0.84 and
+the deliberate abstention scored 0.50–0.56 — overlapping, so a cut cannot separate them,
+while the labels separate perfectly. A separate run elsewhere put correct answers from 0.76
+and wrong ones up to 0.88, which is the same finding from the other side.
 
 ### Tell it what changed, not what you tried
 

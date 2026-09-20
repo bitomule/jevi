@@ -103,6 +103,10 @@ pub struct Decide {
     /// against the shipped numbers so that a cut set by hand to the same value as the
     /// default still reads as a cut somebody chose.
     pub tuned: bool,
+    /// True when `min_confidence` specifically was supplied. Tracked apart from `tuned`
+    /// because a `--yes-at` on a choice question must not make every answer under the
+    /// shipped 0.9 report a confidence nobody asked about.
+    pub min_confidence_set: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -119,6 +123,7 @@ impl Default for Decide {
             min_confidence: DEFAULT_MIN_CONFIDENCE,
             validated: None,
             tuned: false,
+            min_confidence_set: false,
         }
     }
 }
@@ -291,6 +296,7 @@ fn parse_decide(name: &str, raw: Option<&Value>) -> Result<Decide> {
         )));
     }
     let min_confidence = num("min_confidence", DEFAULT_MIN_CONFIDENCE)?;
+    let min_confidence_set = obj.contains_key("min_confidence");
 
     let validated = obj.get("validated").map(|v| Validated {
         model: v.get("model").and_then(Value::as_str).map(str::to_owned),
@@ -306,6 +312,7 @@ fn parse_decide(name: &str, raw: Option<&Value>) -> Result<Decide> {
         min_confidence,
         validated,
         tuned,
+        min_confidence_set,
     })
 }
 
@@ -368,6 +375,7 @@ pub fn shorthand(
         min_confidence: min_confidence.unwrap_or(DEFAULT_MIN_CONFIDENCE),
         validated: None,
         tuned: yes_at.is_some() || no_at.is_some() || min_confidence.is_some(),
+        min_confidence_set: min_confidence.is_some(),
     };
     if decide.no > decide.yes {
         return Err(Error::invalid("flags", "--no-at is above --yes-at"));
