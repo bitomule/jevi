@@ -61,18 +61,24 @@ pub fn document(
         // told apart from a row written by a version that did not record them, and the
         // reader of a stored row is exactly who this field exists for.
         entry.insert("thresholds".into(), json!(o.thresholds.source.as_str()));
-        if o.thresholds.source != Source::Default {
-            // Only the cuts that could have decided THIS verdict: a noul never consults
-            // min_confidence, and a choice or a score never consults yes/no. Printing the
-            // unused ones would invite somebody to believe they mattered.
-            entry.insert(
-                "cuts".into(),
-                if o.kind == "noul" {
-                    json!({ "yes": o.thresholds.yes, "no": o.thresholds.no })
-                } else {
-                    json!({ "min_confidence": o.thresholds.min_confidence })
-                },
-            );
+        // Only the cuts that could have touched THIS answer: a noul never consults
+        // min_confidence, and since 0.3.0 a choice or a score never consults yes/no and is
+        // never decided by min_confidence either — there it is advice, printed only when
+        // somebody named it. Printing an unused cut invites the reader to believe it
+        // mattered, which is the failure the whole field exists to prevent.
+        let cuts = if o.kind == "noul" {
+            (o.thresholds.source != Source::Default)
+                .then(|| json!({ "yes": o.thresholds.yes, "no": o.thresholds.no }))
+        } else {
+            o.thresholds
+                .min_confidence_set
+                .then(|| json!({ "advisory_min_confidence": o.thresholds.min_confidence }))
+        };
+        if let Some(cuts) = cuts {
+            entry.insert("cuts".into(), cuts);
+        }
+        if let Some(p) = &o.probabilities {
+            entry.insert("probabilities".into(), p.clone());
         }
         answers.insert(name.clone(), Value::Object(entry));
     }
@@ -108,6 +114,7 @@ mod tests {
             yes: 0.9,
             no: 0.1,
             min_confidence: 0.9,
+            min_confidence_set: false,
         }
     }
 
@@ -119,6 +126,7 @@ mod tests {
             number: Some(p),
             confidence: None,
             warning: None,
+            probabilities: None,
             thresholds: shipped(),
         }
     }
@@ -170,7 +178,34 @@ mod tests {
     }
 
     #[test]
-    fn a_choice_discloses_the_cut_that_could_have_decided_it_and_not_the_others() {
+    fn a_choice_discloses_an_advisory_confidence_only_when_somebody_named_one() {
+        let o = Outcome {
+            kind: "choice".into(),
+            verdict: Verdict::Yes,
+            label: Some("bug".into()),
+            number: None,
+            confidence: Some(0.71),
+            warning: Some("low_confidence"),
+            probabilities: None,
+            thresholds: Thresholds {
+                source: Source::Custom,
+                min_confidence: 0.6,
+                min_confidence_set: true,
+                ..shipped()
+            },
+        };
+        let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
+        assert_eq!(doc["answers"]["a"]["cuts"]["advisory_min_confidence"], 0.6);
+        assert!(doc["answers"]["a"]["cuts"].get("yes").is_none());
+        // Advice, next to a real answer. Not the answer.
+        assert_eq!(doc["answers"]["a"]["verdict"], "yes");
+        assert_eq!(doc["answers"]["a"]["label"], "bug");
+    }
+
+    #[test]
+    fn a_choice_nobody_set_a_confidence_on_discloses_no_cut_at_all() {
+        // A `--yes-at` makes the source `custom`, and until 0.3.0 that printed a
+        // `min_confidence` next to a choice which had consulted nothing.
         let o = Outcome {
             kind: "choice".into(),
             verdict: Verdict::Yes,
@@ -178,14 +213,24 @@ mod tests {
             number: None,
             confidence: Some(0.71),
             warning: None,
+            probabilities: None,
             thresholds: Thresholds {
                 source: Source::Custom,
-                min_confidence: 0.6,
                 ..shipped()
             },
         };
         let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
-        assert_eq!(doc["answers"]["a"]["cuts"]["min_confidence"], 0.6);
-        assert!(doc["answers"]["a"]["cuts"].get("yes").is_none());
+        assert!(doc["answers"]["a"].get("cuts").is_none());
+    }
+
+    #[test]
+    fn the_services_own_per_option_probabilities_reach_the_document() {
+        // What replaces the cut jevi used to impose: the caller gets the provider's own
+        // numbers and makes its own call, if it wants one at all.
+        let mut o = noul(0.5, Verdict::Yes);
+        o.kind = "choice".into();
+        o.probabilities = Some(json!({"bug": 0.6, "feature": 0.4}));
+        let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
+        assert_eq!(doc["answers"]["a"]["probabilities"]["bug"], 0.6);
     }
 }

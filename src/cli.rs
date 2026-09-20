@@ -8,6 +8,9 @@ use clap::{Args, Parser, Subcommand};
     long_about = "Ask typed questions about a text and branch on the answer.\n\n\
         Exit codes: 0 yes, 1 no, 3 unsure, 4 no answer (no key, no network, API error),\n\
         5 invalid input. Never 2 — a hook's exit 2 means \"block\" to Claude Code.\n\n\
+        --options and --levels always exit 0 with the answer in them: read the chosen\n\
+        option or the score, not the verdict. Include an option meaning \"none of these\"\n\
+        if you need the model to be able to decline — it never declines on its own.\n\n\
         With --soft, 4 and 5 become 0 and stdout carries {\"ok\":false,...}: branch on the\n\
         JSON, not on the exit code.",
     disable_help_subcommand = true
