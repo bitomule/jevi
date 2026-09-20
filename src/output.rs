@@ -19,10 +19,13 @@ pub fn terse(names: &[String], outcomes: &[Outcome], single: bool) -> String {
             (None, Some(n), _) => s.push_str(&format!("{}\t{n:.2}", o.verdict.as_str())),
             (None, None, _) => s.push_str(o.verdict.as_str()),
         }
+        // There used to be a second arm here marking `!unsure` on an answer that had a
+        // label and an unsure verdict. Since a choice and a score are no longer decided by
+        // a confidence cut, the only way either reaches `unsure` is a provenance rule, and
+        // that always sets a warning — so the arm became unreachable. An unreachable branch
+        // that reads as if it fires is what kept `state_too_large` dead for six releases.
         if let Some(w) = o.warning {
             s.push_str(&format!("\t!{w}"));
-        } else if o.verdict == crate::decide::Verdict::Unsure && o.label.is_some() {
-            s.push_str("\t!unsure");
         }
         s.push('\n');
     }
@@ -175,6 +178,25 @@ mod tests {
         let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
         assert_eq!(doc["answers"]["a"]["thresholds"], "custom");
         assert_eq!(doc["answers"]["a"]["cuts"]["yes"], 0.5);
+    }
+
+    #[test]
+    fn a_low_confidence_choice_prints_its_answer_with_the_advice_beside_it() {
+        let o = Outcome {
+            kind: "choice".into(),
+            verdict: Verdict::Yes,
+            label: Some("Acerca de".into()),
+            number: None,
+            confidence: Some(0.62),
+            warning: Some("low_confidence"),
+            probabilities: None,
+            thresholds: shipped(),
+        };
+        // The answer first, the advice after it. Not "unsure".
+        assert_eq!(
+            terse(&["a".into()], &[o], true),
+            "Acerca de\t0.62\t!low_confidence\n"
+        );
     }
 
     #[test]
