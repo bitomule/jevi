@@ -141,6 +141,73 @@ fn a_question_and_a_set_together_is_refused() {
     assert_eq!(code(&out), 5);
 }
 
+/// `--questions-json`, and the reason it exists.
+///
+/// A caller whose options change on every call — one candidate list per screen — had no way
+/// to say so: `-f` takes a path or a name, so the only route was writing a temporary file
+/// per call inside a hot loop. These run offline, because what is being checked is that the
+/// question is accepted and reaches the point of being sent, and exit 4 is the API being
+/// unreachable rather than the question being wrong.
+mod questions_json {
+    use super::*;
+
+    const SET: &str = r#"{"version":1,"questions":{"answer":{"type":"choice",
+        "instructions":{"goal":"the settings button","rules":["answer none if absent"]},
+        "criteria":{"1":{"role":"button","name":"Ajustes"},"none":"none"}}}}"#;
+
+    #[test]
+    fn a_question_set_inline_is_accepted_and_sent() {
+        let out = run(
+            &["ask", "--questions-json", SET],
+            "1) label=Ajustes role=button",
+        );
+        assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn the_set_can_come_from_stdin_with_the_state_on_a_flag() {
+        let out = run(
+            &[
+                "ask",
+                "--questions-json",
+                "-",
+                "--text",
+                "1) label=Ajustes role=button",
+            ],
+            SET,
+        );
+        assert_eq!(code(&out), 4, "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Both cannot come from stdin, and saying so beats parsing the set out of the state.
+    #[test]
+    fn the_set_on_stdin_without_a_state_flag_is_refused() {
+        let out = run(&["ask", "--questions-json", "-"], SET);
+        assert_eq!(code(&out), 5);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--text"));
+    }
+
+    #[test]
+    fn two_sources_for_one_question_is_refused() {
+        for args in [
+            vec!["ask", "is this urgent", "--questions-json", SET],
+            vec!["ask", "--questions-json", SET, "-f", "whatever"],
+        ] {
+            let out = run(&args, "text");
+            assert_eq!(code(&out), 5, "accepted two question sources: {args:?}");
+        }
+    }
+
+    /// Invalid input, not a failed call: this request will be wrong again, so a caller that
+    /// degrades on exit 4 must not degrade on this.
+    #[test]
+    fn a_broken_set_is_exit_5_and_names_the_flag() {
+        let out = run(&["ask", "--questions-json", "{nope"], "text");
+        assert_eq!(code(&out), 5);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--questions-json"));
+    }
+}
+
 #[test]
 fn the_disable_switch_works_without_editing_the_caller() {
     let mut cmd = Command::cargo_bin("jevi").expect("binary is built");

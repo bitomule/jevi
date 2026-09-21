@@ -173,7 +173,83 @@ fn low_confidence(confidence: Option<f64>, decide: &Decide) -> Option<&'static s
     (decide.min_confidence_set && c < decide.min_confidence).then_some("low_confidence")
 }
 
-pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> Outcome {
+/// Does this answer actually describe the menu it was given?
+///
+/// Both clients written against this endpoint natively do exactly this before they act, and
+/// they refuse to act at all when it fails. jevi did none of it: it read `choice` as a
+/// string and handed it over, so an answer naming an option that was never offered arrived
+/// looking like every correct answer, and every caller had to build the check again — `mav`
+/// carries one called `veto_not_a_candidate`, which is this function in Go.
+///
+/// The line drawn here, and it matters: a check fires only on an answer that is **wrong**,
+/// never on one that is merely **thin**. A `probabilities` block that names an option
+/// nobody offered is a wrong answer. A `probabilities` block that is absent is less
+/// information, not bad information, so it gets a note somewhere else and decides nothing.
+///
+/// Honest about what it is worth: across 654 real calls made while building this — 640 down
+/// mav's bench and 14 deliberately awkward menus, keys with quotes and slashes, keys that
+/// are numbers, keys differing only in case, 255 options, a key that is the empty string —
+/// **not one answer failed any of these checks.** The service is well behaved. This is a
+/// guard against the day it is not, or against a proxy, a gateway or a different model
+/// behind the same URL, and its cost is nothing: no round trip and no judgement.
+fn choice_faults(answer: &Value, offered: &[String]) -> Option<&'static str> {
+    let Some(choice) = answer.get("choice").and_then(Value::as_str) else {
+        return None; // handled by the caller: no option came back at all.
+    };
+    if !offered.is_empty() && !offered.iter().any(|o| o == choice) {
+        return Some("off_menu_answer");
+    }
+
+    // A missing distribution is the "thin, not wrong" case — less information rather than
+    // bad information — so it falls out of here with no fault, which is why the rest is
+    // nested rather than guarded: `None` from this function means "nothing wrong found",
+    // and an early `?` would read as propagating a fault it does not have.
+    if let Some(probabilities) = answer.get("probabilities").and_then(Value::as_object) {
+        if !offered.is_empty()
+            && (probabilities.len() != offered.len()
+                || !offered.iter().all(|o| probabilities.contains_key(o)))
+        {
+            return Some("probabilities_off_menu");
+        }
+
+        let mut total = 0.0;
+        for v in probabilities.values() {
+            let Some(n) = v.as_f64() else {
+                return Some("probabilities_not_a_distribution");
+            };
+            if !n.is_finite() || !(0.0..=1.0).contains(&n) {
+                return Some("probabilities_not_a_distribution");
+            }
+            total += n;
+        }
+        if (total - 1.0).abs() >= 0.02 {
+            return Some("probabilities_not_a_distribution");
+        }
+
+        // The chosen option has to be the one the distribution puts on top. Any other pair
+        // is two answers to one question, with nothing saying which one is the answer. The
+        // slack is for a tie: the service reports rounded numbers, so two options at 0.5
+        // with either named as the choice is sound.
+        let highest = probabilities
+            .values()
+            .filter_map(Value::as_f64)
+            .fold(f64::NEG_INFINITY, f64::max);
+        return match probabilities.get(choice).and_then(Value::as_f64) {
+            Some(p) if p >= highest - 1e-6 => None,
+            Some(_) => Some("answer_contradicts_probabilities"),
+            None => Some("probabilities_off_menu"),
+        };
+    }
+
+    None
+}
+
+pub fn outcome(
+    answer: &Value,
+    decide: &Decide,
+    provenance: &Provenance<'_>,
+    offered: &[String],
+) -> Outcome {
     let kind = answer
         .get("type")
         .and_then(Value::as_str)
@@ -209,6 +285,20 @@ pub fn outcome(answer: &Value, decide: &Decide, provenance: &Provenance<'_>) -> 
                 .map(str::to_owned);
             let confidence = answer.get("confidence").and_then(Value::as_f64);
             match label {
+                // An answer that does not describe the menu it was given is withheld, not
+                // reported: handing over a label jevi cannot vouch for is the exact shape of
+                // failure this binary exists to prevent, and `unsure` is already the word
+                // for "nobody knows". The caller sees exit 3 and the fault by name.
+                Some(_) if choice_faults(answer, offered).is_some() => Outcome {
+                    kind,
+                    verdict: Verdict::Unsure,
+                    label: None,
+                    number: None,
+                    confidence,
+                    warning: choice_faults(answer, offered),
+                    probabilities: answer.get("probabilities").cloned(),
+                    thresholds,
+                },
                 Some(label) => Outcome {
                     kind,
                     // The chosen option IS the answer. See the note on `low_confidence`.
@@ -297,6 +387,124 @@ mod tests {
         }
     }
 
+    /// Does the answer describe the menu it was given?
+    ///
+    /// These are the checks both clients written against this endpoint natively make before
+    /// they act. None of them has ever fired against the live service — 654 real calls,
+    /// including 14 deliberately awkward menus — so every case here is built by hand. That
+    /// is the point: the day a proxy, a gateway or a different model behind the same URL
+    /// reshapes a response, this is what stands between the caller and a label jevi cannot
+    /// vouch for.
+    mod the_answer_has_to_describe_the_menu {
+        use super::*;
+
+        fn menu() -> Vec<String> {
+            ["1", "2", "none"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        }
+
+        fn judge(answer: serde_json::Value) -> Outcome {
+            outcome(&answer, &Decide::default(), &no_provenance(), &menu())
+        }
+
+        #[test]
+        fn a_sound_answer_is_handed_over_untouched() {
+            let out = judge(json!({"type":"choice","choice":"2","confidence":0.8,
+                                   "probabilities":{"1":0.1,"2":0.8,"none":0.1}}));
+            assert_eq!(out.verdict, Verdict::Yes);
+            assert_eq!(out.label.as_deref(), Some("2"));
+            assert_eq!(out.warning, None);
+        }
+
+        /// The one mav had to build for itself, in Go, under the name
+        /// `veto_not_a_candidate`: an answer naming something that was never on the menu.
+        #[test]
+        fn an_option_that_was_never_offered_is_not_an_answer() {
+            let out = judge(json!({"type":"choice","choice":"7",
+                                   "probabilities":{"1":0.1,"2":0.8,"none":0.1}}));
+            assert_eq!(out.verdict, Verdict::Unsure);
+            assert_eq!(out.warning, Some("off_menu_answer"));
+            assert_eq!(out.label, None, "a label jevi cannot vouch for is withheld");
+        }
+
+        #[test]
+        fn a_distribution_that_does_not_cover_the_menu_is_not_an_answer() {
+            for probabilities in [
+                json!({"1": 0.5, "2": 0.5}),                        // `none` missing
+                json!({"1": 0.3, "2": 0.3, "none": 0.3, "7": 0.1}), // an option nobody offered
+            ] {
+                let out =
+                    judge(json!({"type":"choice","choice":"2","probabilities":probabilities}));
+                assert_eq!(out.warning, Some("probabilities_off_menu"));
+                assert_eq!(out.verdict, Verdict::Unsure);
+            }
+        }
+
+        #[test]
+        fn numbers_that_are_not_a_distribution_are_not_an_answer() {
+            for probabilities in [
+                json!({"1": 0.1, "2": 0.1, "none": 0.1}),    // sums to 0.3
+                json!({"1": 0.5, "2": 0.9, "none": 0.1}),    // sums to 1.5
+                json!({"1": -0.1, "2": 1.0, "none": 0.1}),   // outside 0..1
+                json!({"1": "high", "2": 0.8, "none": 0.1}), // not a number at all
+            ] {
+                let out =
+                    judge(json!({"type":"choice","choice":"2","probabilities":probabilities}));
+                assert_eq!(
+                    out.warning,
+                    Some("probabilities_not_a_distribution"),
+                    "accepted {probabilities}"
+                );
+            }
+        }
+
+        /// Two answers to one question, and nothing says which of them is the answer.
+        #[test]
+        fn a_choice_that_is_not_the_most_probable_option_is_two_answers() {
+            let out = judge(json!({"type":"choice","choice":"1",
+                                   "probabilities":{"1":0.1,"2":0.8,"none":0.1}}));
+            assert_eq!(out.warning, Some("answer_contradicts_probabilities"));
+            assert_eq!(out.verdict, Verdict::Unsure);
+        }
+
+        /// A tie is not a contradiction: the service reports rounded numbers, so two options
+        /// at 0.5 with either named as the choice is a sound answer.
+        #[test]
+        fn a_tie_at_the_top_is_sound() {
+            let out = judge(json!({"type":"choice","choice":"1",
+                                   "probabilities":{"1":0.5,"2":0.5,"none":0.0}}));
+            assert_eq!(out.verdict, Verdict::Yes);
+            assert_eq!(out.warning, None);
+        }
+
+        /// A missing distribution is less information, not wrong information, so it decides
+        /// nothing. The direct TypeSafe endpoint has never been exercised from here, and a
+        /// check that turned every answer from an unverified provider into `unsure` would be
+        /// jevi breaking a caller over a shape it had merely never seen.
+        #[test]
+        fn an_answer_with_no_probabilities_is_thin_not_wrong() {
+            let out = judge(json!({"type":"choice","choice":"2","confidence":0.8}));
+            assert_eq!(out.verdict, Verdict::Yes);
+            assert_eq!(out.label.as_deref(), Some("2"));
+        }
+
+        /// With no menu to check against there is nothing to check, and "I cannot check
+        /// this" must not read as "this failed". A noul and a score offer no options at all.
+        #[test]
+        fn no_menu_means_no_check_not_a_failed_check() {
+            let out = outcome(
+                &json!({"type":"choice","choice":"whatever","probabilities":{"whatever":1.0}}),
+                &Decide::default(),
+                &no_provenance(),
+                &[],
+            );
+            assert_eq!(out.verdict, Verdict::Yes);
+            assert_eq!(out.label.as_deref(), Some("whatever"));
+        }
+    }
+
     #[test]
     fn noul_lands_in_the_three_bands() {
         let d = Decide {
@@ -304,7 +512,8 @@ mod tests {
             no: 0.5,
             ..Decide::default()
         };
-        let at = |p: f64| outcome(&json!({"type":"noul","noul":p}), &d, &no_provenance()).verdict;
+        let at =
+            |p: f64| outcome(&json!({"type":"noul","noul":p}), &d, &no_provenance(), &[]).verdict;
         assert_eq!(at(0.94), Verdict::Yes);
         assert_eq!(at(0.44), Verdict::No);
         assert_eq!(at(0.70), Verdict::Unsure);
@@ -316,6 +525,7 @@ mod tests {
             &json!({"type":"noul","noul":0.96}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert!(out.confidence.is_none());
     }
@@ -330,6 +540,7 @@ mod tests {
             &json!({"type":"choice","choice":"Acerca de","confidence":0.62}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.verdict, Verdict::Yes);
         assert_eq!(out.label.as_deref(), Some("Acerca de"));
@@ -349,6 +560,7 @@ mod tests {
             &json!({"type":"choice","choice":"bug","confidence":0.61}),
             &d,
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.verdict, Verdict::Yes);
         assert_eq!(out.warning, Some("low_confidence"));
@@ -360,6 +572,7 @@ mod tests {
             &json!({"type":"choice","choice":"bug","confidence":0.11}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert!(out.warning.is_none());
     }
@@ -374,6 +587,7 @@ mod tests {
             &json!({"type":"choice","choice":"ninguno","confidence":0.52}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.label.as_deref(), Some("ninguno"));
         assert_eq!(out.verdict, Verdict::Yes);
@@ -385,6 +599,7 @@ mod tests {
             &json!({"type":"choice","confidence":0.9}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.verdict, Verdict::Unsure);
         assert_eq!(out.warning, Some("incomplete_answer"));
@@ -404,6 +619,7 @@ mod tests {
             &json!({"type":"score","score":2.0,"confidence":0.4}),
             &d,
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.verdict, Verdict::Yes);
         assert_eq!(out.number, Some(2.0));
@@ -417,6 +633,7 @@ mod tests {
                     "probabilities":{"bug":0.6,"feature":0.4}}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.probabilities.expect("passed through")["bug"], 0.6);
     }
@@ -428,6 +645,7 @@ mod tests {
                     "legend":{"0":"trivial","1":"minor","2":"major","3":"blocking"}}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.label.as_deref(), Some("blocking"));
         assert_eq!(out.number, Some(2.57));
@@ -448,7 +666,7 @@ mod tests {
             model_used: Some("typesafe/jev-2.0"),
             state_chars: 0,
         };
-        let out = outcome(&json!({"type":"noul","noul":0.99}), &d, &p);
+        let out = outcome(&json!({"type":"noul","noul":0.99}), &d, &p, &[]);
         assert_eq!(out.verdict, Verdict::Unsure);
         assert_eq!(out.warning, Some("model_mismatch"));
     }
@@ -466,7 +684,7 @@ mod tests {
             model_used: Some("typesafe/jev-1.13-20260917"),
             state_chars: 0,
         };
-        let out = outcome(&json!({"type":"noul","noul":0.99}), &d, &p);
+        let out = outcome(&json!({"type":"noul","noul":0.99}), &d, &p, &[]);
         assert_eq!(out.verdict, Verdict::Yes);
         assert!(out.warning.is_none());
     }
@@ -484,7 +702,7 @@ mod tests {
             model_used: None,
             state_chars: 4000,
         };
-        let out = outcome(&json!({"type":"noul","noul":0.99}), &d, &p);
+        let out = outcome(&json!({"type":"noul","noul":0.99}), &d, &p, &[]);
         assert_eq!(out.verdict, Verdict::Unsure);
         assert_eq!(out.warning, Some("length_mismatch"));
     }
@@ -495,6 +713,7 @@ mod tests {
             &json!({"type":"choice"}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.verdict, Verdict::Unsure);
         assert_eq!(out.warning, Some("incomplete_answer"));
@@ -506,6 +725,7 @@ mod tests {
             &json!({"type":"noul","noul":0.99}),
             &Decide::default(),
             &no_provenance(),
+            &[],
         );
         assert_eq!(out.thresholds.source, Source::Default);
     }
@@ -521,12 +741,12 @@ mod tests {
             ..Decide::default()
         };
 
-        let out = outcome(&answer, &tuned, &no_provenance());
+        let out = outcome(&answer, &tuned, &no_provenance(), &[]);
         assert_eq!(out.verdict, Verdict::Yes);
         assert_eq!(out.thresholds.source, Source::Custom);
         assert_eq!(out.thresholds.yes, 0.5);
 
-        let out = outcome(&answer, &Decide::default(), &no_provenance());
+        let out = outcome(&answer, &Decide::default(), &no_provenance(), &[]);
         assert_eq!(out.verdict, Verdict::Unsure);
         assert_eq!(out.thresholds.source, Source::Default);
     }
@@ -542,7 +762,12 @@ mod tests {
             }),
             ..Decide::default()
         };
-        let out = outcome(&json!({"type":"noul","noul":0.99}), &d, &no_provenance());
+        let out = outcome(
+            &json!({"type":"noul","noul":0.99}),
+            &d,
+            &no_provenance(),
+            &[],
+        );
         assert_eq!(out.thresholds.source, Source::Validated);
         assert_eq!(out.thresholds.yes, 0.8);
     }

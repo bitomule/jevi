@@ -67,31 +67,9 @@ fn ask(a: Ask) -> Result<i32> {
     }
 
     let cfg = Config::load()?;
-    let prepared = match (&a.set, &a.instructions) {
-        (Some(_), Some(_)) => {
-            return Err(Error::invalid("flags", "give a question or -f, not both"))
-        }
-        (Some(name), None) => {
-            let (raw, origin) = cfg.resolve_set(name)?;
-            QuestionSet::parse(&raw, &origin)?.prepare()?
-        }
-        (None, Some(text)) => jevi::internal::shorthand(
-            text,
-            a.options.as_deref(),
-            a.levels.as_deref(),
-            a.yes_at,
-            a.no_at,
-            a.min_confidence,
-        )?,
-        (None, None) => {
-            return Err(Error::invalid(
-                "flags",
-                "no question given — try `jevi ask --help`",
-            ))
-        }
-    };
+    let prepared = question_source(&a)?.prepare(&cfg)?;
 
-    let single = prepared.names.len() == 1 && a.set.is_none();
+    let single = prepared.names.len() == 1 && a.set.is_none() && a.questions_json.is_none();
     let raw_state = read_state(&a)?;
 
     let cap = resolve_cap(a.max_chars, prepared.max_chars);
@@ -176,6 +154,91 @@ fn ask(a: Ask) -> Result<i32> {
 /// place to pin one, because that is the length its thresholds were measured at.
 fn resolve_cap(flag: Option<usize>, from_set: Option<usize>) -> usize {
     flag.or(from_set).unwrap_or(0)
+}
+
+/// Where the question came from. Three sources and never two at once, resolved before
+/// anything is read, because two of them can want stdin and only one of them can have it.
+enum Source<'a> {
+    /// `-f`: a path, or a name looked up in ./.jevi/ then the config directory.
+    Set(&'a str),
+    /// `--questions-json`: the set inline, for a question that is built per call. The case
+    /// this exists for is a caller whose options change on every screen — writing a
+    /// temporary file per call inside a hot loop was the only way to say that before.
+    Json(&'a str),
+    /// `--questions-json -`: the set on stdin, for a set too big to sit in argv.
+    JsonStdin,
+    /// The positional question a person types at a terminal.
+    Shorthand(&'a Ask),
+}
+
+fn question_source(a: &Ask) -> Result<Source<'_>> {
+    let given = [
+        a.set.is_some(),
+        a.questions_json.is_some(),
+        a.instructions.is_some(),
+    ]
+    .iter()
+    .filter(|g| **g)
+    .count();
+    if given > 1 {
+        return Err(Error::invalid(
+            "flags",
+            "give the question one way: a positional question, -f, or --questions-json",
+        ));
+    }
+    if let Some(name) = a.set.as_deref() {
+        return Ok(Source::Set(name));
+    }
+    if let Some(raw) = a.questions_json.as_deref() {
+        if raw != "-" {
+            return Ok(Source::Json(raw));
+        }
+        // stdin carries the question now, so it cannot also carry the text to judge. Said
+        // here rather than left to produce a set parsed out of the state and a state parsed
+        // out of nothing, which is the confusing half of the same mistake.
+        if a.state_text.is_none() && a.state.is_none() {
+            return Err(Error::invalid(
+                "flags",
+                "`--questions-json -` reads the question from stdin, so the text to judge \
+                 has to come from --text or --state",
+            ));
+        }
+        return Ok(Source::JsonStdin);
+    }
+    if a.instructions.is_some() {
+        return Ok(Source::Shorthand(a));
+    }
+    Err(Error::invalid(
+        "flags",
+        "no question given — try `jevi ask --help`",
+    ))
+}
+
+impl Source<'_> {
+    fn prepare(self, cfg: &Config) -> Result<jevi::Prepared> {
+        match self {
+            Source::Set(name) => {
+                let (raw, origin) = cfg.resolve_set(name)?;
+                QuestionSet::parse(&raw, &origin)?.prepare()
+            }
+            Source::Json(raw) => QuestionSet::parse(raw, "--questions-json")?.prepare(),
+            Source::JsonStdin => {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| Error::invalid("question_file", e.to_string()))?;
+                QuestionSet::parse(&buf, "--questions-json -")?.prepare()
+            }
+            Source::Shorthand(a) => jevi::internal::shorthand(
+                a.instructions.as_deref().unwrap_or_default(),
+                a.options.as_deref(),
+                a.levels.as_deref(),
+                a.yes_at,
+                a.no_at,
+                a.min_confidence,
+            ),
+        }
+    }
 }
 
 fn read_state(a: &Ask) -> Result<String> {

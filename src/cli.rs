@@ -56,6 +56,11 @@ pub struct Ask {
     #[arg(short = 'f', long = "questions")]
     pub set: Option<String>,
 
+    /// The whole question set as JSON, for a question that is built per call. `-` reads it
+    /// from stdin, and then the text to judge has to come from --text or --state.
+    #[arg(long = "questions-json", value_name = "JSON")]
+    pub questions_json: Option<String>,
+
     /// Turn the positional question into a choice between these options.
     #[arg(long, value_name = "a,b,c", conflicts_with = "levels")]
     pub options: Option<String>,

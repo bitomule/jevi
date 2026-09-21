@@ -51,6 +51,147 @@ $ cat report.md | jevi ask -f triage --json
 `-f NAME` looks in `./.jevi/NAME.json`, then `$XDG_CONFIG_HOME/bitomule/jevi/questions/`.
 `-f ./path.json` reads a path. See [`questions/examples`](questions/examples).
 
+## A question built per call, with no file
+
+`--options a,b,c` makes every option describe itself with its own name, and the real
+information about each one has to go in the state as prose for the model to cross-reference.
+When the options are a fixed vocabulary that is fine. When they are the eight tappable rows
+of whatever screen is on the device right now, it is not: the options change on every call,
+and until this flag existed the only way to say so was writing a temporary file per call
+inside a hot loop.
+
+`--questions-json` takes the whole set — the same schema as `-f` — inline, so an option can
+carry its own record and nothing touches disk:
+
+```console
+$ mav ui tree --json | jevi ask --json --questions-json "$(build_question)"
+```
+
+Where `build_question` emits:
+
+```json
+{ "version": 1, "questions": { "answer": {
+  "type": "choice",
+  "instructions": {
+    "goal": "the settings button",
+    "rules": ["Each option is one element on the screen.",
+              "Answer none if none of them is it."]
+  },
+  "criteria": {
+    "settingsButton": { "role": "button", "name": "Ajustes" },
+    "searchField":    { "role": "search text field", "value": "Buscar" },
+    "none":           { "role": "none", "name": "no element is the one described" }
+  }
+}}}
+```
+
+Two things there that `--options` cannot express, and both are the API's own and were only
+ever blocked here:
+
+- **An option is an object.** The key is the thing's identifier and the value is its record.
+- **`instructions` is an object.** A string still works and nothing about it changes; an
+  object lets the goal be a field rather than a sentence, which is what the two clients
+  written against this endpoint natively send.
+
+`--questions-json -` reads the set from stdin instead, for a set too large for `argv`. stdin
+is then taken, so the text to judge has to come from `--text` or `--state`.
+
+### The order you write the keys in is part of the question
+
+Not formatting. Measured on one recorded cell of mav's ablation bench — same words, same
+options, same state, 30 runs each — the identical request scored **29/30** with the keys in
+the order the caller wrote them and **2/30** with them sorted alphabetically.
+
+Up to 0.3.0 jevi sorted them. `serde_json` without `preserve_order` parses every object
+into a `BTreeMap`, so `{goal, context, rules}` left as `{context, goal, rules}` and an
+option written `{role, name, id}` as `{id, name, role}` — while this file and the source
+both said the question travelled to the API untouched. The values did. The order did not,
+and the order was worth 27 of 30.
+
+So: put the thing being asked first, and the boilerplate after it. And if you have measured
+a question shape through some other client, **re-measure it through jevi 0.4 or later** —
+anything measured through an earlier one was measured with its key order destroyed.
+
+### What the shape buys, measured
+
+The same bench, four phrases over two captured iOS screens, 10 to 30 runs a cell, hits and
+correct abstentions counted separately because a false positive taps something and an
+abstention does not:
+
+| question shape | hits | correct abstentions |
+| --- | --- | --- |
+| `--options 1,2,3,none` — every option named after its own number | 20/40 | 10/40 |
+| each option carrying its record, nothing else changed | 20/40 | 10/40 |
+| records **and** `instructions` as an object | **30/40** | 10/40 |
+
+Three findings in that table, and the middle row is the one to read twice:
+
+- **Structured options on their own buy nothing.** Cell for cell identical to the numbered
+  options across 80 paired runs.
+- **The combination buys ten hits in forty and costs no abstentions**, and it needs three
+  things at once — the records, the object, and the rendered numbered list still in the
+  state. Remove any one of the three and the cell that moved returns to where it started.
+- **Copying a native client wholesale is worse than either.** The exact shape
+  `browser-use/jev-ultrafast` sends — a structured `elements` state, options keyed by index
+  with `{element, role, value}`, `instructions {goal, rules}` — measures 20/40, the same as
+  the numbered options.
+
+And two things no shape fixed: a request for "the first box" on a screen with no box on it
+still returns the search field (0/30 before, 1/30 after), and the structured records cost
+33% more input tokens. Measure your own case. The shape is neither free nor a fix.
+
+## Asking several questions at once
+
+The service answers a whole set in one round trip — four questions of three different types
+came back in 317 ms — and the pattern its documentation calls *speculative fan-out* leans on
+that: ask everything you might need, including the questions you probably will not use, and
+let your code pick which answers are relevant. Both clients written against this endpoint
+natively do exactly that.
+
+`jevi` sends whatever the set contains, so `-f` or `--questions-json` with several questions
+is that pattern. **Read the answers from `--json`, not from the exit code.** The code
+describes the first question only, and any `unsure` anywhere wins — which is right for a set
+of questions you all care about, and wrong for a fan-out, where a speculative head you never
+consume would gate the whole call.
+
+## What travels and what does not
+
+`decide` and `notes` stay in this process. Everything else in a question is forwarded exactly
+as written — every field, every value, and the order of every object — including fields this
+build has never heard of, so a new API field works without waiting for a jevi release.
+
+What jevi checks before sending is what the service refuses, and nothing more. Measured
+against the endpoint rather than read off the documentation, which is wrong in three places:
+
+| | the service | jevi |
+| --- | --- | --- |
+| `instructions` as a string, object or array | answers | forwards |
+| `instructions` `null`, absent, or a number | **400** | exit 5, before the call |
+| `instructions` empty (`""`, `{}`, `[]`) | answers | forwards, with a note |
+| a Choice option's value: string, object, array or `null` | answers | forwards |
+| a Choice option's value: a number or a boolean | **400** | exit 5 |
+| a Score level: string, object or array | answers | forwards |
+| a Score level: `null` | **400** | exit 5 |
+| a Noul's `criteria.true`/`false`: `null` | **400** | exit 5 |
+| 1 option, or 1 score level | answers, uselessly | forwards, with a note |
+| 256 options, or 11 score levels | **400** | exit 5 |
+
+The documentation says all four of those places accept `null`. Only a Choice option does.
+That distinction is worth a local refusal rather than a round trip, because a 400 arrives at
+a caller as **exit 4, no answer** — the code that means "the service could not be reached,
+carry on degraded" — when the truth is a malformed request that will be malformed next time
+too.
+
+The answer is checked on the way back as well, and this is the check both native clients
+make before they act on anything: the chosen option has to be one that was actually offered,
+the per-option probabilities have to cover exactly the menu and sum to 1, and the chosen
+option has to be the most probable one. An answer failing any of those is reported as
+`unsure` with the fault named, and **the label is withheld** rather than handed over. In 654
+real calls made while building this — including 14 deliberately awkward menus, keys with
+quotes and backslashes, keys that are numbers, keys differing only in case, 255 options, a
+key that is the empty string — not one answer failed a single check. It is a guard against
+the day something sits between you and the model, not a bug being worked around.
+
 ## Three outcomes, because two would be a lie
 
 ```
