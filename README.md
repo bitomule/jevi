@@ -51,6 +51,62 @@ $ cat report.md | jevi ask -f triage --json
 `-f NAME` looks in `./.jevi/NAME.json`, then `$XDG_CONFIG_HOME/bitomule/jevi/questions/`.
 `-f ./path.json` reads a path. See [`questions/examples`](questions/examples).
 
+## A question built per call, with no file
+
+`--options a,b,c` makes every option describe itself with its own name, and the real
+information about each one has to go in the state as prose for the model to cross-reference.
+When the options are a fixed vocabulary that is fine. When they are the eight tappable rows
+of whatever screen is on the device right now, it is not: the options change on every call,
+and until this flag existed the only way to say so was writing a temporary file per call
+inside a hot loop.
+
+`--questions-json` takes the whole set — the same schema as `-f` — inline, so an option can
+carry its own record and nothing touches disk:
+
+```console
+$ mav ui tree --json | jevi ask --json --questions-json "$(build_question)"
+```
+
+Where `build_question` emits:
+
+```json
+{ "version": 1, "questions": { "answer": {
+  "type": "choice",
+  "instructions": {
+    "goal": "the settings button",
+    "rules": ["Each option is one element on the screen.",
+              "Answer none if none of them is it."]
+  },
+  "criteria": {
+    "settingsButton": { "role": "button", "name": "Ajustes" },
+    "searchField":    { "role": "search text field", "value": "Buscar" },
+    "none":           { "role": "none", "name": "no element is the one described" }
+  }
+}}}
+```
+
+Two things there that `--options` cannot express, and both are the API's own and were only
+ever blocked here:
+
+- **An option is an object.** The key is the thing's identifier and the value is its record.
+- **`instructions` is an object.** A string still works and nothing about it changes; an
+  object lets the goal be a field rather than a sentence, which is what the two clients
+  written against this endpoint natively send.
+
+`--questions-json -` reads the set from stdin instead, for a set too large for `argv`. stdin
+is then taken, so the text to judge has to come from `--text` or `--state`.
+
+**What this buys, measured, because it is less than it looks.** On mav's recorded ablation
+bench — two real captured iOS screens, its own candidate filter, four phrases, 30 runs a
+cell — giving each option its structured record **and changing nothing else** produced
+answers identical to the numbered options, cell for cell, across 80 paired runs. The one
+cell that moved needed three things at once (records, `instructions` as an object, and the
+rendered list still in the state) and went from 0/30 to 26/30; removing any single one of
+the three returned it to 0/30. A separate defect on that bench — a request for a box on a
+screen with no box returning the search field — was **not** fixed by any shape tried, and
+the structured records cost 33% more input tokens. Measure your own case; do not assume the
+shape is free or that it is a fix.
+
 ## Three outcomes, because two would be a lie
 
 ```

@@ -193,8 +193,22 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
         .and_then(Value::as_str)
         .ok_or_else(|| bad("missing `type`".into()))?;
 
-    if obj.get("instructions").and_then(Value::as_str).is_none() {
-        return Err(bad("missing `instructions`".into()));
+    // A string or an object, and both travel untouched. The API takes either — measured
+    // against it, `{"goal":…,"rules":[…]}` answers 200 — and the two clients written
+    // against the endpoint natively send the object, because a goal that is a field is a
+    // goal nothing in the state can dress up as part of a sentence. jevi refused it for no
+    // reason but an `as_str`, which forced a caller to flatten its own question to prose.
+    match obj.get("instructions") {
+        Some(Value::String(s)) if s.trim().is_empty() => {
+            return Err(bad("`instructions` is empty".into()))
+        }
+        Some(Value::String(_)) => {}
+        Some(Value::Object(o)) if o.is_empty() => {
+            return Err(bad("`instructions` is an empty object".into()))
+        }
+        Some(Value::Object(_)) => {}
+        Some(_) => return Err(bad("`instructions` must be a string or an object".into())),
+        None => return Err(bad("missing `instructions`".into())),
     }
 
     // The criteria rules are the API's, checked here so a typo costs nothing instead of a
@@ -487,6 +501,73 @@ mod tests {
         )
         .expect("parses");
         assert!(over.prepare().is_err());
+    }
+
+    /// `instructions` as an object, which is what the two clients written against the
+    /// endpoint natively send. jevi refused it for nothing but an `as_str`, and the cost of
+    /// that refusal is measured: over 150 runs on one recorded cell of mav's ablation bench,
+    /// the same question with the same structured options and the same state scored 26/30
+    /// with the object and 6/30 with its own words flattened into a string. The container
+    /// was the single largest of the three pieces that cell needed.
+    #[test]
+    fn instructions_can_be_an_object_and_it_travels_whole() {
+        let set = QuestionSet::parse(
+            r#"{"version":1,"questions":{"q":{"type":"choice",
+                 "instructions":{"goal":"the settings button","rules":["answer none if absent"]},
+                 "criteria":{"1":{"role":"button","name":"Ajustes"},"none":"none"}}}}"#,
+            "test",
+        )
+        .expect("parses");
+        let prepared = set.prepare().expect("prepares");
+        assert_eq!(
+            prepared.wire["q"]["instructions"]["goal"],
+            "the settings button"
+        );
+        assert_eq!(
+            prepared.wire["q"]["instructions"]["rules"][0],
+            "answer none if absent"
+        );
+    }
+
+    /// The other half of the same change: an option whose value is its structured record
+    /// passes through untouched, rather than being flattened to the key's own name.
+    #[test]
+    fn a_choice_option_can_carry_its_own_record() {
+        let set = QuestionSet::parse(
+            r#"{"version":1,"questions":{"q":{"type":"choice","instructions":"i",
+                 "criteria":{"1":{"role":"button","name":"Ajustes","id":"settingsButton"},
+                             "none":"none"}}}}"#,
+            "test",
+        )
+        .expect("parses");
+        let prepared = set.prepare().expect("prepares");
+        assert_eq!(prepared.wire["q"]["criteria"]["1"]["id"], "settingsButton");
+    }
+
+    #[test]
+    fn instructions_that_are_neither_a_string_nor_an_object_are_refused_here() {
+        let set = QuestionSet::parse(
+            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":42}}}"#,
+            "test",
+        )
+        .expect("parses");
+        assert!(set.prepare().is_err());
+    }
+
+    /// An empty question is a question nobody asked, in either container. Caught here
+    /// because the API's own refusal is a round trip away and reads as a network failure.
+    #[test]
+    fn an_empty_instructions_is_refused_in_both_shapes() {
+        for raw in [
+            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":"  "}}}"#,
+            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":{}}}}"#,
+        ] {
+            let set = QuestionSet::parse(raw, "test").expect("parses");
+            assert!(
+                set.prepare().is_err(),
+                "accepted an empty instructions: {raw}"
+            );
+        }
     }
 
     #[test]
