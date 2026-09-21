@@ -123,7 +123,10 @@ pub fn ask(
         .zip(&prepared.decide)
         .map(|(name, d)| {
             let answer = response.answers.get(name).cloned().unwrap_or(Value::Null);
-            decide::outcome(&answer, d, &provenance)
+            // The options this question actually offered, so the answer can be checked
+            // against the menu instead of taken on trust. Only the caller's own request
+            // knows them; by the time a response is being read they are otherwise gone.
+            decide::outcome(&answer, d, &provenance, &offered_options(prepared, name))
         })
         .collect();
 
@@ -155,6 +158,19 @@ pub fn ask_raw(
         .unwrap_or_else(|| cfg.model(p, opts.model.as_deref()));
     let body = p.body(&model, state, &prepared.wire);
     http::post(&cfg.url(p), &key, &body, cfg.timeout_ms(opts.timeout_ms))
+}
+
+/// The option keys of a choice question, read back off the request that was sent. Empty for
+/// a noul or a score, and empty means "nothing to check against" rather than "check failed".
+fn offered_options(prepared: &Prepared, name: &str) -> Vec<String> {
+    prepared
+        .wire
+        .get(name)
+        .filter(|q| q.get("type").and_then(Value::as_str) == Some("choice"))
+        .and_then(|q| q.get("criteria"))
+        .and_then(Value::as_object)
+        .map(|c| c.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn state_len(state: &Value) -> usize {

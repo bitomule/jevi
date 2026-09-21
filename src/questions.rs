@@ -49,10 +49,21 @@ const RECOMMENDED_CHOICES: usize = 8;
 /// The rule now is the one a wrapper should follow: refuse what the service refuses, warn
 /// about what the service merely discourages.
 fn check_choice_len(name: &str, len: usize) -> Result<()> {
-    if len < 2 {
+    if len == 0 {
         return Err(Error::invalid(
             "question_file",
-            format!("question `{name}`: choice needs at least 2 options, got {len}"),
+            format!("question `{name}`: choice needs at least one option, got none"),
+        ));
+    }
+    // One option was refused here for the same reason 9 used to be, and it is the same
+    // mistake: measured against the endpoint, a choice with a single option is accepted and
+    // answered. It is a useless question — it can only ever return that option — but a
+    // caller building its options per call from whatever is on the screen will hit a screen
+    // with one candidate, and exit 5 "invalid input" is a worse answer than the answer.
+    if len == 1 {
+        note(&format!(
+            "question `{name}` offers one option, so it can only return that option. The \
+             service answers it; nothing is being decided. Set JEVI_QUIET=1 to silence this."
         ));
     }
     if len > MAX_CHOICES {
@@ -68,6 +79,38 @@ fn check_choice_len(name: &str, len: usize) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The service calls this an `EntryType`, and it is the same rule in four places:
+/// `instructions`, a Choice option's description, a Score level, and a Noul's `true` and
+/// `false`. The documentation says all four accept `string`, `object`, `array` **or
+/// `null``**, and measured against the endpoint that last one is only true of a Choice
+/// option. `instructions: null`, a `null` among Score levels, and `criteria.true: null`
+/// each come back 400.
+///
+/// So the flag exists because the docs are wrong about three of the four, and the numbers
+/// and booleans are refused everywhere. Checked here rather than over the wire: a 400 is an
+/// `Error::NoAnswer` to a caller that cannot see inside it, which reads as "the service was
+/// unreachable, carry on degraded" — when the truth is a malformed request that will be
+/// malformed again.
+fn check_entry(name: &str, field: &str, v: &Value, null_ok: bool) -> Result<()> {
+    let ok = match v {
+        Value::String(_) | Value::Object(_) | Value::Array(_) => true,
+        Value::Null => null_ok,
+        Value::Bool(_) | Value::Number(_) => false,
+    };
+    if ok {
+        return Ok(());
+    }
+    let allowed = if null_ok {
+        "a string, an object, an array or null"
+    } else {
+        "a string, an object or an array"
+    };
+    Err(Error::invalid(
+        "question_file",
+        format!("question `{name}`: {field} must be {allowed}"),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,26 +236,39 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
         .and_then(Value::as_str)
         .ok_or_else(|| bad("missing `type`".into()))?;
 
-    // A string or an object, and both travel untouched. The API takes either — measured
-    // against it, `{"goal":…,"rules":[…]}` answers 200 — and the two clients written
-    // against the endpoint natively send the object, because a goal that is a field is a
-    // goal nothing in the state can dress up as part of a sentence. jevi refused it for no
-    // reason but an `as_str`, which forced a caller to flatten its own question to prose.
+    // `instructions` is an `EntryType` — a string, an object or an array, all three sent
+    // untouched. It was a string and nothing else here, enforced by an `as_str` and by
+    // nothing in the service, and that refusal had a measured price: on one recorded cell of
+    // mav's ablation bench the same question with the same options and the same state scored
+    // 26/30 with `instructions` as an object and 6/30 with its own words flattened into a
+    // string. Both clients written against this endpoint natively send the object.
+    //
+    // An empty string and an empty object are answered by the service, so they are a note
+    // and not a refusal — same rule as the option count above. `null`, a missing field and
+    // any scalar are refused, because the service refuses them.
     match obj.get("instructions") {
-        Some(Value::String(s)) if s.trim().is_empty() => {
-            return Err(bad("`instructions` is empty".into()))
+        Some(v) => {
+            check_entry(name, "`instructions`", v, false)?;
+            let empty = match v {
+                Value::String(s) => s.trim().is_empty(),
+                Value::Object(o) => o.is_empty(),
+                Value::Array(a) => a.is_empty(),
+                _ => false,
+            };
+            if empty {
+                note(&format!(
+                    "question `{name}` has empty `instructions`, so the only thing saying what \
+                     is being asked is the options. The service answers it. Set JEVI_QUIET=1 to \
+                     silence this."
+                ));
+            }
         }
-        Some(Value::String(_)) => {}
-        Some(Value::Object(o)) if o.is_empty() => {
-            return Err(bad("`instructions` is an empty object".into()))
-        }
-        Some(Value::Object(_)) => {}
-        Some(_) => return Err(bad("`instructions` must be a string or an object".into())),
         None => return Err(bad("missing `instructions`".into())),
     }
 
     // The criteria rules are the API's, checked here so a typo costs nothing instead of a
-    // round trip and a 400.
+    // round trip and a 400 — and a 400 does not even reach the caller as invalid input, it
+    // reaches it as "no answer", which is the code that means "carry on degraded".
     match kind {
         "noul" => {
             match obj.get("criteria") {
@@ -222,6 +278,12 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
                     })?;
                     if !c.contains_key("true") || !c.contains_key("false") {
                         return Err(bad("noul `criteria` needs both `true` and `false`".into()));
+                    }
+                    // Extra keys beside the two are accepted by the service, so they pass.
+                    for key in ["true", "false"] {
+                        if let Some(v) = c.get(key) {
+                            check_entry(name, &format!("noul `criteria.{key}`"), v, false)?;
+                        }
                     }
                 }
                 // Legal, and answered, and the single cheapest thing you can do to this
@@ -236,14 +298,37 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
                 .and_then(Value::as_object)
                 .ok_or_else(|| bad("choice needs `criteria` as an object of options".into()))?;
             check_choice_len(name, c.len())?;
+            // The one place `null` really is allowed, and it is the documented way to say
+            // "the key is the whole option": `{"Beaver Dam Logistics": null, …}`.
+            for (option, v) in c {
+                check_entry(name, &format!("choice option `{option}`"), v, true)?;
+            }
         }
         "score" => {
             let c = obj
                 .get("criteria")
                 .and_then(Value::as_array)
                 .ok_or_else(|| bad("score needs `criteria` as an array of levels".into()))?;
-            if !(2..=10).contains(&c.len()) {
-                return Err(bad(format!("score needs 2-10 levels, got {}", c.len())));
+            // 1 level is accepted and answered by the service — uselessly, since the answer
+            // can only be that level — so it is a note. 11 come back
+            // `Too many score levels. Must have at most 10 levels.`
+            if c.is_empty() {
+                return Err(bad("score needs at least one level, got none".into()));
+            }
+            if c.len() > 10 {
+                return Err(bad(format!(
+                    "score takes at most 10 levels, got {}",
+                    c.len()
+                )));
+            }
+            if c.len() == 1 {
+                note(&format!(
+                    "question `{name}` offers one score level, so it can only return that \
+                     level. Set JEVI_QUIET=1 to silence this."
+                ));
+            }
+            for (i, v) in c.iter().enumerate() {
+                check_entry(name, &format!("score level {i}"), v, false)?;
             }
         }
         other => return Err(bad(format!("unknown type `{other}`"))),
@@ -253,6 +338,14 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
 
     // Everything except our two private keys travels to the API untouched, so a field this
     // build has never heard of still reaches the model.
+    //
+    // "Untouched" is load-bearing and it was not true until `serde_json`'s `preserve_order`
+    // was turned on in Cargo.toml. A `BTreeMap` re-sorts the keys of every object it parses,
+    // so this loop faithfully cloned values into a question whose ORDER had already been
+    // rewritten: `{goal, context, rules}` left as `{context, goal, rules}`. Measured on one
+    // recorded cell of mav's ablation bench, 30 runs each through this binary, everything
+    // else identical: 2/30 correct sorted, 29/30 in the order the caller wrote. If that
+    // feature is ever dropped, this comment becomes a lie again and nothing will fail.
     let wire = obj
         .iter()
         .filter(|(k, _)| k.as_str() != "decide" && k.as_str() != "notes")
@@ -365,11 +458,19 @@ pub fn shorthand(
         }
         (None, Some(list)) => {
             let items = split_list(list, "--levels")?;
-            if !(2..=10).contains(&items.len()) {
+            // The service's own bounds, so this flag refuses exactly what a question set
+            // refuses: 10 levels are accepted and 11 come back `Too many score levels`.
+            if items.len() > 10 {
                 return Err(Error::invalid(
                     "flags",
-                    format!("--levels takes 2-10 values, got {}", items.len()),
+                    format!("--levels takes at most 10 values, got {}", items.len()),
                 ));
+            }
+            if items.len() == 1 {
+                note(
+                    "--levels was given one level, so the score can only be that level. \
+                     Set JEVI_QUIET=1 to silence this.",
+                );
             }
             q.insert("type".into(), Value::String("score".into()));
             q.insert(
@@ -438,6 +539,56 @@ mod tests {
         assert_eq!(prepared.decide[0].yes, 0.8);
     }
 
+    /// The guard on `serde_json`'s `preserve_order`, and it is a real guard rather than a
+    /// tautology: with that feature off this test fails and the tool silently gets worse.
+    ///
+    /// A `BTreeMap` re-sorts the keys of every object it parses, so a question written
+    /// `{goal, context, rules}` reached the model as `{context, goal, rules}` and an option
+    /// written `{role, name, id}` as `{id, name, role}` — while the source claimed the
+    /// question travelled untouched. Measured on one recorded cell of mav's ablation bench,
+    /// 30 runs each through the binary, same words, same options, same state: 2/30 correct
+    /// with the keys sorted, 29/30 in the order the caller wrote them. The order was worth
+    /// 27 of 30, so it is part of the question and not formatting.
+    #[test]
+    fn the_order_the_caller_wrote_the_keys_in_survives() {
+        let set = QuestionSet::parse(
+            r#"{"version":1,"questions":{"q":{"type":"choice",
+                 "instructions":{"goal":"g","context":"c","rules":["r"]},
+                 "criteria":{"1":{"role":"button","name":"Ajustes","id":"settingsButton"},
+                             "none":"none"}}}}"#,
+            "test",
+        )
+        .expect("parses");
+        let prepared = set.prepare().expect("prepares");
+
+        let keys = |v: &Value| -> Vec<String> {
+            v.as_object()
+                .expect("object")
+                .keys()
+                .map(String::clone)
+                .collect()
+        };
+        assert_eq!(
+            keys(&prepared.wire["q"]["instructions"]),
+            ["goal", "context", "rules"],
+            "the keys of `instructions` were re-sorted on the way through"
+        );
+        assert_eq!(
+            keys(&prepared.wire["q"]["criteria"]["1"]),
+            ["role", "name", "id"],
+            "the keys of an option's record were re-sorted on the way through"
+        );
+
+        // And once more through serialisation, which is what actually goes on the wire.
+        let body = serde_json::to_string(&prepared.wire).expect("serialises");
+        let goal = body.find(r#""goal""#).expect("goal is in the body");
+        let context = body.find(r#""context""#).expect("context is in the body");
+        assert!(
+            goal < context,
+            "serialising put the keys back in sorted order"
+        );
+    }
+
     #[test]
     fn an_unknown_question_field_still_travels() {
         let set = QuestionSet::parse(
@@ -473,9 +624,19 @@ mod tests {
         .prepare()
     }
 
+    /// One option used to be refused, for the same reason nine used to be, and it was the
+    /// same mistake: measured against the endpoint, a single-option choice is accepted and
+    /// answered. A caller building its options per call will meet a screen with one
+    /// candidate, and `exit 5 invalid input` is a worse answer than the answer. It still
+    /// decides nothing, so it gets a note.
     #[test]
-    fn one_option_is_not_a_choice() {
-        assert!(choice_with(1).is_err());
+    fn one_option_is_a_pointless_choice_and_not_a_refused_one() {
+        assert!(choice_with(1).is_ok());
+    }
+
+    #[test]
+    fn no_options_at_all_is_still_refused() {
+        assert!(choice_with(0).is_err());
     }
 
     #[test]
@@ -554,18 +715,68 @@ mod tests {
         assert!(set.prepare().is_err());
     }
 
-    /// An empty question is a question nobody asked, in either container. Caught here
-    /// because the API's own refusal is a round trip away and reads as a network failure.
+    /// The rule this file has stated since the nine-options mistake, applied again: refuse
+    /// what the service refuses and warn about the rest. Measured, one call each: an empty
+    /// string and an empty object both come back 200 and answered, so they are a note.
     #[test]
-    fn an_empty_instructions_is_refused_in_both_shapes() {
+    fn an_empty_instructions_is_answered_by_the_service_so_it_is_not_refused_here() {
         for raw in [
-            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":"  "}}}"#,
-            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":{}}}}"#,
+            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":"  ","criteria":{"true":"a","false":"b"}}}}"#,
+            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":{},"criteria":{"true":"a","false":"b"}}}}"#,
+            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":[],"criteria":{"true":"a","false":"b"}}}}"#,
+        ] {
+            let set = QuestionSet::parse(raw, "test").expect("parses");
+            assert!(
+                set.prepare().is_ok(),
+                "refused what the service answers: {raw}"
+            );
+        }
+    }
+
+    /// `instructions` as an array, the third shape the service takes. jev-ultrafast uses a
+    /// list where it has two rule sets to send (`"rules": [NEXT_ACTION, TARGET]`), and the
+    /// docs give the same example for "the instruction is a list of things to check".
+    #[test]
+    fn instructions_can_be_an_array() {
+        let set = QuestionSet::parse(
+            r#"{"version":1,"questions":{"q":{"type":"choice",
+                 "instructions":["which team handles this","classify the primary request"],
+                 "criteria":{"billing":null,"orders":null}}}}"#,
+            "test",
+        )
+        .expect("parses");
+        let prepared = set.prepare().expect("prepares");
+        assert_eq!(
+            prepared.wire["q"]["instructions"][1],
+            "classify the primary request"
+        );
+    }
+
+    /// The documentation says `null` is an accepted shape in all four places an `EntryType`
+    /// appears. Measured against the endpoint it is true in exactly one of them: a Choice
+    /// option. `instructions: null`, a `null` among Score levels and `criteria.true: null`
+    /// each come back 400, and a 400 reaches a caller as "no answer" — the code that means
+    /// "carry on degraded" — so refusing them here is the difference between a defect being
+    /// surfaced and a defect being shrugged off.
+    #[test]
+    fn null_is_only_allowed_where_the_service_allows_it_not_where_the_docs_say() {
+        let ok = r#"{"version":1,"questions":{"q":{"type":"choice","instructions":"which",
+                     "criteria":{"Beaver Dam Logistics":null,"Beaver":null}}}}"#;
+        assert!(QuestionSet::parse(ok, "test")
+            .expect("parses")
+            .prepare()
+            .is_ok());
+
+        for raw in [
+            r#"{"version":1,"questions":{"q":{"type":"choice","instructions":null,"criteria":{"a":null,"b":null}}}}"#,
+            r#"{"version":1,"questions":{"q":{"type":"score","instructions":"how big","criteria":["a",null,"c"]}}}"#,
+            r#"{"version":1,"questions":{"q":{"type":"noul","instructions":"is it","criteria":{"true":null,"false":"no"}}}}"#,
+            r#"{"version":1,"questions":{"q":{"type":"choice","instructions":"which","criteria":{"a":1,"b":2}}}}"#,
         ] {
             let set = QuestionSet::parse(raw, "test").expect("parses");
             assert!(
                 set.prepare().is_err(),
-                "accepted an empty instructions: {raw}"
+                "accepted what the service answers with a 400: {raw}"
             );
         }
     }
