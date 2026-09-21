@@ -33,7 +33,15 @@ system-roots = ["ureq/platform-verifier"]
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` is not a nicety, it is the difference between forwarding a question and
+# rewriting it. Without it every object jevi parses becomes a BTreeMap and comes out
+# alphabetically sorted, so a question written `{goal, context, rules}` reaches the model as
+# `{context, goal, rules}` and an option written `{role, name, id}` as `{id, name, role}`.
+# Measured on one recorded cell of mav's ablation bench, same words, same options, same
+# state, 30 runs each: 28/30 correct in the order the caller wrote it, 3/30 sorted. The
+# source used to claim the question "travels to the API untouched"; the values did, the
+# order did not, and the order was worth 25 of 30.
+serde_json = { version = "1", features = ["preserve_order"] }
 anyhow = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
