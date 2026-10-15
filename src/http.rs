@@ -10,7 +10,13 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 
-pub fn post(url: &str, key: &str, body: &Value, timeout_ms: u64) -> Result<Value> {
+pub fn post(
+    url: &str,
+    key: &str,
+    body: &Value,
+    headers: &[(&str, &str)],
+    timeout_ms: u64,
+) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut attempt = 0;
 
@@ -23,7 +29,7 @@ pub fn post(url: &str, key: &str, body: &Value, timeout_ms: u64) -> Result<Value
             ));
         }
 
-        match try_once(url, key, body, left) {
+        match try_once(url, key, body, headers, left) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 // One retry, and only while there is real time left to use it. Retrying
@@ -41,7 +47,13 @@ pub fn post(url: &str, key: &str, body: &Value, timeout_ms: u64) -> Result<Value
     }
 }
 
-fn try_once(url: &str, key: &str, body: &Value, budget: Duration) -> Result<Value> {
+fn try_once(
+    url: &str,
+    key: &str,
+    body: &Value,
+    headers: &[(&str, &str)],
+    budget: Duration,
+) -> Result<Value> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(budget))
         // Without this, ureq turns a 4xx into `Error::StatusCode(code)` — a code and nothing
@@ -54,11 +66,14 @@ fn try_once(url: &str, key: &str, body: &Value, budget: Duration) -> Result<Valu
         .build()
         .into();
 
-    let response = agent
+    let mut request = agent
         .post(url)
         .header("Authorization", &format!("Bearer {key}"))
-        .header("Content-Type", "application/json")
-        .send_json(body);
+        .header("Content-Type", "application/json");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.send_json(body);
 
     match response {
         Ok(mut r) if r.status().is_success() => r
@@ -184,6 +199,7 @@ mod tests {
             &format!("http://{addr}/decisions"),
             "test",
             &serde_json::json!({"state":"x"}),
+            &[],
             4000,
         )
         .expect_err("a 400 is not an answer");

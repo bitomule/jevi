@@ -16,7 +16,7 @@ use std::io::{IsTerminal, Read, Write};
 use clap::Parser;
 use serde_json::Value;
 
-use jevi::{AskOptions, Config, Error, Provider, QuestionSet, Result, Verdict};
+use jevi::{AskOptions, Config, Error, Image, Provider, QuestionSet, Result, Verdict};
 
 use crate::cli::{Ask, Cli, Command, ConfigCmd};
 
@@ -70,16 +70,21 @@ fn ask(a: Ask) -> Result<i32> {
     let prepared = question_source(&a)?.prepare(&cfg)?;
 
     let single = prepared.names.len() == 1 && a.set.is_none() && a.questions_json.is_none();
-    let raw_state = read_state(&a)?;
+    let images = jevi::internal::parse_specs(&a.images)
+        .iter()
+        .map(|(name, path)| Image::open(name, path))
+        .collect::<Result<Vec<_>>>()?;
+    let raw_state = read_state(&a, !images.is_empty())?;
 
     let cap = resolve_cap(a.max_chars, prepared.max_chars);
-    let built = build_state(&raw_state, a.state_json, cap)?;
+    let built = build_state(&raw_state, a.state_json, cap, !images.is_empty())?;
 
     let opts = AskOptions {
         provider: a.provider.clone(),
         model: a.model.clone(),
         timeout_ms: a.timeout,
         state_chars: Some(built.chars),
+        images,
     };
 
     if a.raw {
@@ -196,7 +201,7 @@ fn question_source(a: &Ask) -> Result<Source<'_>> {
         // stdin carries the question now, so it cannot also carry the text to judge. Said
         // here rather than left to produce a set parsed out of the state and a state parsed
         // out of nothing, which is the confusing half of the same mistake.
-        if a.state_text.is_none() && a.state.is_none() {
+        if a.state_text.is_none() && a.state.is_none() && a.images.is_empty() {
             return Err(Error::invalid(
                 "flags",
                 "`--questions-json -` reads the question from stdin, so the text to judge \
@@ -233,6 +238,7 @@ impl Source<'_> {
                 a.instructions.as_deref().unwrap_or_default(),
                 a.options.as_deref(),
                 a.levels.as_deref(),
+                a.boxed,
                 a.yes_at,
                 a.no_at,
                 a.min_confidence,
@@ -241,7 +247,9 @@ impl Source<'_> {
     }
 }
 
-fn read_state(a: &Ask) -> Result<String> {
+/// With an image, the text is optional: a question about a screenshot may have nothing else
+/// to judge, and a terminal stdin then means "no text" rather than a mistake.
+fn read_state(a: &Ask, has_images: bool) -> Result<String> {
     if let Some(t) = &a.state_text {
         return Ok(t.clone());
     }
@@ -250,6 +258,9 @@ fn read_state(a: &Ask) -> Result<String> {
             .map_err(|e| Error::invalid("state", format!("{path}: {e}")));
     }
     if std::io::stdin().is_terminal() {
+        if has_images {
+            return Ok(String::new());
+        }
         return Err(Error::invalid(
             "state",
             "nothing on stdin — pipe the text in, or use --text/--state",
@@ -271,7 +282,14 @@ struct Built {
     dropped: usize,
 }
 
-fn build_state(raw: &str, as_json: bool, cap: usize) -> Result<Built> {
+fn build_state(raw: &str, as_json: bool, cap: usize, has_images: bool) -> Result<Built> {
+    if raw.trim().is_empty() && has_images {
+        return Ok(Built {
+            state: Value::Null,
+            chars: 0,
+            dropped: 0,
+        });
+    }
     if raw.trim().is_empty() {
         return Err(Error::invalid("state", "the text to judge is empty"));
     }
@@ -439,10 +457,10 @@ mod tests {
         // The control that ties the constant to behaviour: 130_000 characters went through
         // `build_state` at the old default and came back at 80_000 with 50_000 dropped.
         let raw = "x".repeat(130_000);
-        let old = build_state(&raw, false, 80_000).expect("builds");
+        let old = build_state(&raw, false, 80_000, false).expect("builds");
         assert_eq!(old.dropped, 50_000);
 
-        let now = build_state(&raw, false, resolve_cap(None, None)).expect("builds");
+        let now = build_state(&raw, false, resolve_cap(None, None), false).expect("builds");
         assert_eq!(now.dropped, 0);
         assert_eq!(now.chars, 130_000);
     }
@@ -450,7 +468,7 @@ mod tests {
     #[test]
     fn a_long_string_state_is_truncated_and_says_so() {
         let raw = "x".repeat(200);
-        let b = build_state(&raw, false, 50).expect("builds");
+        let b = build_state(&raw, false, 50, false).expect("builds");
         assert_eq!(b.chars, 50);
         assert!(b
             .state
@@ -465,7 +483,7 @@ mod tests {
         // to decide whether this answer is about the whole input — and until it existed, a
         // state cut in half produced a document indistinguishable from a complete one.
         assert_eq!(
-            build_state(&"x".repeat(200), false, 50)
+            build_state(&"x".repeat(200), false, 50, false)
                 .expect("builds")
                 .dropped,
             150
@@ -474,19 +492,29 @@ mod tests {
 
     #[test]
     fn a_state_that_fits_reports_nothing_dropped() {
-        assert_eq!(build_state("short", false, 50).expect("builds").dropped, 0);
+        assert_eq!(
+            build_state("short", false, 50, false)
+                .expect("builds")
+                .dropped,
+            0
+        );
     }
 
     #[test]
     fn a_json_state_is_never_truncated() {
         let raw = format!(r#"{{"a":"{}"}}"#, "x".repeat(200));
-        let b = build_state(&raw, true, 50).expect("builds");
+        let b = build_state(&raw, true, 50, false).expect("builds");
         assert_eq!(b.state["a"].as_str().expect("string").len(), 200);
         assert_eq!(b.dropped, 0);
     }
 
     #[test]
     fn an_empty_state_is_refused_before_any_network() {
-        assert_eq!(build_state("   \n", false, 0).expect_err("fails").code(), 5);
+        assert_eq!(
+            build_state("   \n", false, 0, false)
+                .expect_err("fails")
+                .code(),
+            5
+        );
     }
 }

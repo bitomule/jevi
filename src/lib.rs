@@ -38,6 +38,7 @@ mod config;
 mod decide;
 mod error;
 mod http;
+mod image;
 mod output;
 mod provider;
 mod questions;
@@ -47,8 +48,9 @@ use std::time::Instant;
 use serde_json::Value;
 
 pub use crate::config::{config_dir, config_path, Config};
-pub use crate::decide::{Outcome, Source, Thresholds, Verdict};
+pub use crate::decide::{Outcome, Region, Source, Thresholds, Verdict};
 pub use crate::error::{Error, Result};
+pub use crate::image::{Format as ImageFormat, Image};
 pub use crate::provider::Provider;
 pub use crate::questions::{set_quiet, Decide, Prepared, QuestionSet, Validated};
 
@@ -75,6 +77,8 @@ pub struct AskOptions {
     /// How long the state was, in characters, for the `validated.max_chars` check. Leave it
     /// at `None` and it is measured from the state itself.
     pub state_chars: Option<usize>,
+    /// Images to put in the state, each under its name. See [`Image`].
+    pub images: Vec<Image>,
 }
 
 /// Send one state and its questions, and turn the reply into verdicts.
@@ -100,14 +104,22 @@ pub fn ask(
             ),
         )
     })?;
-    let model = prepared
-        .model
-        .clone()
-        .unwrap_or_else(|| cfg.model(p, opts.model.as_deref()));
-
-    let body = p.body(&model, state, &prepared.wire);
+    let model = model_for(cfg, p, prepared, opts)?;
+    let request = p.request(
+        &model,
+        state,
+        &prepared.wire,
+        &opts.images,
+        prepared.has_box(),
+    )?;
     let started = Instant::now();
-    let response_body = http::post(&cfg.url(p), &key, &body, cfg.timeout_ms(opts.timeout_ms))?;
+    let response_body = http::post(
+        &cfg.url(p),
+        &key,
+        &request.body,
+        &request.headers,
+        cfg.timeout_ms(opts.timeout_ms),
+    )?;
     let latency_ms = started.elapsed().as_millis();
 
     let response = provider::read(&response_body)?;
@@ -152,12 +164,45 @@ pub fn ask_raw(
     let key = cfg
         .key_for(p)
         .ok_or_else(|| Error::no_answer("no_key", format!("no credential for {}", p.name())))?;
-    let model = prepared
+    let model = model_for(cfg, p, prepared, opts)?;
+    let request = p.request(
+        &model,
+        state,
+        &prepared.wire,
+        &opts.images,
+        prepared.has_box(),
+    )?;
+    http::post(
+        &cfg.url(p),
+        &key,
+        &request.body,
+        &request.headers,
+        cfg.timeout_ms(opts.timeout_ms),
+    )
+}
+
+/// The default stays 1.13 because 1.14 was measured worse on text alone: over 180 calls
+/// choosing an element from a screen's element list, 125 right on 1.13 and 112 on 1.14.
+/// A `box` is the exception, because 1.13 cannot answer one at all — so when nobody chose a
+/// model, a set with a `box` in it goes to the first one that can. When somebody did choose
+/// 1.13, that is refused here rather than sent for a bare 400.
+fn model_for(cfg: &Config, p: Provider, prepared: &Prepared, opts: &AskOptions) -> Result<String> {
+    let pinned = prepared
         .model
         .clone()
-        .unwrap_or_else(|| cfg.model(p, opts.model.as_deref()));
-    let body = p.body(&model, state, &prepared.wire);
-    http::post(&cfg.url(p), &key, &body, cfg.timeout_ms(opts.timeout_ms))
+        .or_else(|| cfg.pinned_model(p, opts.model.as_deref()));
+    match pinned {
+        Some(m) if prepared.has_box() && m.contains("1.13") => Err(Error::invalid(
+            "model",
+            format!(
+                "`{m}` cannot answer a `box` question; use {} or later",
+                p.box_model()
+            ),
+        )),
+        Some(m) => Ok(m),
+        None if prepared.has_box() => Ok(p.box_model().to_owned()),
+        None => Ok(p.default_model().to_owned()),
+    }
 }
 
 /// The option keys of a choice question, read back off the request that was sent. Empty for
@@ -183,7 +228,7 @@ fn state_len(state: &Value) -> usize {
 /// Build a one-off question the way the command line does, for callers that want the same
 /// shorthand without going through a file.
 pub fn shorthand(instructions: &str) -> Result<Prepared> {
-    questions::shorthand(instructions, None, None, None, None, None)
+    questions::shorthand(instructions, None, None, false, None, None, None)
 }
 
 /// Render answers as the normalised JSON document the CLI prints with `--json`.
@@ -207,6 +252,7 @@ pub fn failure_document(kind: &str, message: &str) -> Value {
 #[doc(hidden)]
 pub mod internal {
     //! Used by the `jevi` binary. Not a stable interface; do not depend on it.
+    pub use crate::image::parse_specs;
     pub use crate::output::terse;
     pub use crate::questions::shorthand;
 }

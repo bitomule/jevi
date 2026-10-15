@@ -181,6 +181,15 @@ pub struct Prepared {
     pub max_chars: Option<usize>,
 }
 
+impl Prepared {
+    /// Whether any question is a `box`, which only 1.14 and later can answer.
+    pub fn has_box(&self) -> bool {
+        self.wire
+            .values()
+            .any(|q| q.get("type").and_then(Value::as_str) == Some("box"))
+    }
+}
+
 impl QuestionSet {
     pub fn parse(raw: &str, origin: &str) -> Result<Self> {
         serde_json::from_str(raw)
@@ -331,6 +340,15 @@ fn split_question(name: &str, obj: &Map<String, Value>) -> Result<(Map<String, V
                 check_entry(name, &format!("score level {i}"), v, false)?;
             }
         }
+        // Where something is in an image: the answer is a rectangle and a confidence, and
+        // there are no options, so nothing in `criteria` could mean anything.
+        "box" => {
+            if obj.contains_key("criteria") {
+                return Err(bad(
+                    "a box takes no `criteria`; say what to find in `instructions`".into(),
+                ));
+            }
+        }
         other => return Err(bad(format!("unknown type `{other}`"))),
     }
 
@@ -429,6 +447,7 @@ pub fn shorthand(
     instructions: &str,
     options: Option<&str>,
     levels: Option<&str>,
+    boxed: bool,
     yes_at: Option<f64>,
     no_at: Option<f64>,
     min_confidence: Option<f64>,
@@ -440,6 +459,15 @@ pub fn shorthand(
     );
 
     match (options, levels) {
+        _ if boxed && (options.is_some() || levels.is_some()) => {
+            return Err(Error::invalid(
+                "flags",
+                "--box takes no --options or --levels",
+            ))
+        }
+        _ if boxed => {
+            q.insert("type".into(), Value::String("box".into()));
+        }
         (Some(_), Some(_)) => {
             return Err(Error::invalid(
                 "flags",
@@ -786,5 +814,38 @@ mod tests {
         assert!(
             QuestionSet::parse(r#"{"version":1,"max_char":100,"questions":{}}"#, "test").is_err()
         );
+    }
+
+    #[test]
+    fn a_box_is_a_question_type_and_takes_no_criteria() {
+        let ok = QuestionSet::parse(
+            r#"{"version":1,"questions":{"b":{"type":"box","instructions":"the gear"}}}"#,
+            "test",
+        )
+        .expect("parses")
+        .prepare()
+        .expect("a box is accepted");
+        assert!(ok.has_box());
+
+        let err = QuestionSet::parse(
+            r#"{"version":1,"questions":{"b":{"type":"box","instructions":"the gear",
+                "criteria":{"a":"b"}}}}"#,
+            "test",
+        )
+        .expect("parses")
+        .prepare()
+        .expect_err("criteria mean nothing to a box");
+        assert_eq!(err.code(), 5);
+    }
+
+    #[test]
+    fn the_box_flag_makes_a_box_and_refuses_a_menu() {
+        let p = shorthand("the gear", None, None, true, None, None, None).expect("builds");
+        assert_eq!(p.wire["answer"]["type"], "box");
+        assert!(p.wire["answer"].get("criteria").is_none());
+        assert!(shorthand("the gear", Some("a,b"), None, true, None, None, None).is_err());
+        assert!(!shorthand("is it", None, None, false, None, None, None)
+            .expect("builds")
+            .has_box());
     }
 }

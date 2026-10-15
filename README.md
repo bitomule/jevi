@@ -51,6 +51,81 @@ $ cat report.md | jevi ask -f triage --json
 `-f NAME` looks in `./.jevi/NAME.json`, then `$XDG_CONFIG_HOME/bitomule/jevi/questions/`.
 `-f ./path.json` reads a path. See [`questions/examples`](questions/examples).
 
+## Images
+
+Since Jev 1.14 (14 October 2026) a question can be about a picture. `--image` puts one in the
+state, under a name the question uses for it:
+
+```console
+$ jevi ask "is an error alert visible in \`screen\`" --image shot.png
+no	0.02
+$ mav ui tree | jevi ask -f find --image screen=shot.png    # the text goes under `text`
+```
+
+- PNG or JPEG. A single unnamed image is called `screen`; several are `image1`, `image2`…
+  Name them yourself with `NAME=PATH`.
+- With text as well (stdin, `--text`, `--state`), the state becomes
+  `{"text": …, "screen": <image>}`. With `--state-json` the image is added to your object,
+  and a key that already exists is refused rather than overwritten.
+- **jevi shrinks it for you.** The service refuses anything over 1568 px on a side, and a
+  full-resolution iPhone 17 Pro screenshot is 1206×2622 — sent as it is, it comes back
+  `400 Invalid image dimensions`. jevi scales it to fit (721×1568) before sending. It never
+  enlarges: an image under 256 px on a side is refused, because upscaling invents pixels
+  the model then reasons about.
+- **Cost:** an iPhone screenshot is about 3,200 input tokens, billed like text, so about
+  $0.00014 a call at $42 per billion tokens. It adds about 0.2 s.
+- It works on 1.13 too. The default model does not change; see below.
+
+### What a screenshot buys, measured
+
+The case it was measured for is [mav](https://github.com/bitomule/mav)'s `ui find`: given a
+screen's numbered element list, pick the one a person described, or `none`. Two screens of a
+real iOS 26.3 simulator (the home screen and Settings), 18 descriptions, 10 runs each,
+through OpenRouter on 15 October 2026:
+
+| | right, of 180 | wrong element | input tokens | median |
+|---|---|---|---|---|
+| list only, 1.13 | 125 | 10 | 790 | 0.34 s |
+| list only, 1.14 | 112 | 10 | 790 | 0.33 s |
+| list + screenshot, 1.13 | 170 | 10 | ~3,760 | 0.61 s |
+| list + screenshot, 1.14 | **180** | **0** | ~3,760 | 0.54 s |
+
+- **Visual** descriptions (*the row with the black icon*, *the colourful flower*) go from
+  55/90 to 90/90. The list says `label=En reposo`; only the picture says the icon is black.
+- **Spatial** ones (*the app in the top-right corner of the icon grid*) go from 0/20 to
+  20/20.
+- Descriptions answerable from the text, and things that were not on the screen at all,
+  stayed at 100% in every arm. The image did not cost a single correct abstention.
+
+The descriptions were chosen to need the picture, so read this as "the screenshot answers
+what the list cannot", not as an average over real traffic.
+
+### Where something is: `box`
+
+```console
+$ jevi ask "the settings button" --box --image shot.png
+top=0.070 bottom=0.140 left=0.850 right=0.960	0.75
+```
+
+A `box` answers with a rectangle, as fractions of the image from the top-left corner, so it
+maps onto the original at any size. `"type": "box"` works in a question set too, with
+`instructions` and no `criteria`.
+
+- Only 1.14 answers one; 1.13 returns a bare 400. When you have not chosen a model, jevi
+  sends a `box` to `typesafe/jev-1.14` (`jev-1.14.0` direct). If you pinned 1.13, it is
+  refused before anything is sent.
+- **A box never says "not there".** Asked for things that were not on the screen, it drew a
+  rectangle 30 times out of 30. On things that were there, its centre landed on the right
+  element 136 times out of 150. Ask *whether* with a noul or a choice with `none`, and *where*
+  with a box.
+
+### Why the default model is still 1.13
+
+On the same bench, 1.14 with the list alone was right 112 times against 1.13's 125. It is
+better with the picture and worse without it. jevi keeps the default it was measured on;
+`--model typesafe/jev-1.14`, `JEVI_MODEL` or the config change it. TypeSafe's own
+`jev-latest` alias moves to 1.14 on 21 October 2026, so the direct provider follows it then.
+
 ## A question built per call, with no file
 
 `--options a,b,c` makes every option describe itself with its own name, and the real
@@ -571,7 +646,15 @@ whose answer space you cannot write down in advance.
 | `typesafe` | `https://api.typesafe.ai/v1/systemone` | `jev-latest` |
 
 Whichever has a key is used; with both, OpenRouter, because it is the shape this build has
-verified against real traffic. The TypeSafe direct path is written from its documentation
+verified against real traffic.
+
+Images go differently to each. OpenRouter takes an `image_url` object holding a data URL,
+placed in the state; TypeSafe documents an `assets` map, a reference string in the state, and
+a `TypeSafe-Danger-Zone-Images: true` header. Sent the TypeSafe shape, OpenRouter answers
+without error and drops the image in silence (281 input tokens, the same as the text alone),
+which is why jevi builds one or the other and never both.
+
+The TypeSafe direct path is written from its documentation
 and has not been exercised — if you have a key, `--raw` prints the untouched response and
 `base_url` in the config lets you correct the endpoint without a release. Reports welcome.
 

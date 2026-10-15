@@ -44,6 +44,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 anyhow = "1"
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+# Only to shrink a screenshot to the 1568 px the service accepts — every iPhone screenshot
+# is over it, and a 400 on the first try is not a feature. PNG and JPEG are the two formats
+# the service takes, so they are the only decoders built: 18 packages and 562 KB on the
+# release binary (2.23 MB to 2.79 MB), against dozens for the default feature set.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.23"
 
 [dev-dependencies]
 assert_cmd = "2"

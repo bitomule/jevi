@@ -69,6 +69,18 @@ pub struct Ask {
     #[arg(long, value_name = "low,mid,high")]
     pub levels: Option<String>,
 
+    /// Turn the positional question into a box: where, in the image, is the thing it
+    /// describes. Prints `top= bottom= left= right=` as fractions of the image, and the
+    /// confidence. A box never says "not there"; ask that with a noul or a choice.
+    #[arg(long = "box", conflicts_with_all = ["options", "levels"])]
+    pub boxed: bool,
+
+    /// An image to judge, PNG or JPEG, as NAME=PATH or just PATH. Repeatable. It goes in
+    /// the state under its name, which is how a question refers to it; a single unnamed
+    /// image is called `screen`. Shrunk to 1568 px on its longest side if bigger.
+    #[arg(long = "image", value_name = "[NAME=]PATH")]
+    pub images: Vec<String>,
+
     /// Read the text to judge from this file instead of stdin.
     #[arg(long, value_name = "PATH", conflicts_with = "state_text")]
     pub state: Option<String>,
