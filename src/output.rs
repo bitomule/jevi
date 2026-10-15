@@ -14,6 +14,7 @@ pub fn terse(names: &[String], outcomes: &[Outcome], single: bool) -> String {
             s.push('\t');
         }
         match (&o.label, o.number, o.confidence) {
+            _ if o.region.is_some() => s.push_str(&region_line(o)),
             (Some(label), _, Some(c)) => s.push_str(&format!("{label}\t{c:.2}")),
             (Some(label), _, None) => s.push_str(label),
             (None, Some(n), _) => s.push_str(&format!("{}\t{n:.2}", o.verdict.as_str())),
@@ -30,6 +31,20 @@ pub fn terse(names: &[String], outcomes: &[Outcome], single: bool) -> String {
         s.push('\n');
     }
     s
+}
+
+fn region_line(o: &Outcome) -> String {
+    let Some(r) = o.region else {
+        return String::new();
+    };
+    let edges = format!(
+        "top={:.3} bottom={:.3} left={:.3} right={:.3}",
+        r.top, r.bottom, r.left, r.right
+    );
+    match o.confidence {
+        Some(c) => format!("{edges}\t{c:.2}"),
+        None => edges,
+    }
 }
 
 pub fn document(
@@ -52,6 +67,12 @@ pub fn document(
             entry.insert(
                 if o.kind == "score" { "score" } else { "p" }.into(),
                 json!(n),
+            );
+        }
+        if let Some(r) = o.region {
+            entry.insert(
+                "box".into(),
+                json!({ "top": r.top, "bottom": r.bottom, "left": r.left, "right": r.right }),
             );
         }
         if let Some(c) = o.confidence {
@@ -131,7 +152,41 @@ mod tests {
             warning: None,
             probabilities: None,
             thresholds: shipped(),
+            region: None,
         }
+    }
+
+    fn boxed() -> Outcome {
+        Outcome {
+            kind: "box".into(),
+            verdict: Verdict::Yes,
+            label: None,
+            number: None,
+            confidence: Some(0.75),
+            warning: None,
+            probabilities: None,
+            thresholds: shipped(),
+            region: Some(crate::decide::Region {
+                top: 0.07,
+                bottom: 0.14,
+                left: 0.85,
+                right: 0.96,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_box_prints_its_edges_and_its_confidence() {
+        let out = terse(&["answer".into()], &[boxed()], true);
+        assert_eq!(out, "top=0.070 bottom=0.140 left=0.850 right=0.960\t0.75\n");
+    }
+
+    #[test]
+    fn a_box_is_in_the_document_under_its_own_name() {
+        let doc = document(&["b".into()], &[boxed()], "openrouter", None, None, 1);
+        assert_eq!(doc["answers"]["b"]["box"]["right"], 0.96);
+        assert_eq!(doc["answers"]["b"]["confidence"], 0.75);
+        assert_eq!(doc["answers"]["b"]["verdict"], "yes");
     }
 
     #[test]
@@ -191,6 +246,7 @@ mod tests {
             warning: Some("low_confidence"),
             probabilities: None,
             thresholds: shipped(),
+            region: None,
         };
         // The answer first, the advice after it. Not "unsure".
         assert_eq!(
@@ -215,6 +271,7 @@ mod tests {
                 min_confidence_set: true,
                 ..shipped()
             },
+            region: None,
         };
         let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
         assert_eq!(doc["answers"]["a"]["cuts"]["advisory_min_confidence"], 0.6);
@@ -240,6 +297,7 @@ mod tests {
                 source: Source::Custom,
                 ..shipped()
             },
+            region: None,
         };
         let doc = document(&["a".into()], &[o], "openrouter", None, None, 1);
         assert!(doc["answers"]["a"].get("cuts").is_none());

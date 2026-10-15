@@ -104,10 +104,17 @@ impl Config {
     }
 
     pub fn model(&self, p: Provider, flag: Option<&str>) -> String {
+        self.pinned_model(p, flag)
+            .unwrap_or_else(|| p.default_model().to_owned())
+    }
+
+    /// The model somebody chose — a flag, `JEVI_MODEL`, or the config — as opposed to the
+    /// one jevi falls back to. Only a fallback may be swapped for one that can answer the
+    /// question; a choice is the caller's.
+    pub fn pinned_model(&self, p: Provider, flag: Option<&str>) -> Option<String> {
         flag.map(str::to_owned)
             .or_else(|| std::env::var("JEVI_MODEL").ok().filter(|s| !s.is_empty()))
             .or_else(|| self.per_provider(p, "model").map(str::to_owned))
-            .unwrap_or_else(|| p.default_model().to_owned())
     }
 
     pub fn url(&self, p: Provider) -> String {

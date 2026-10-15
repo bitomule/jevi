@@ -78,6 +78,39 @@ pub struct Outcome {
     pub probabilities: Option<Value>,
     /// Where the cuts that produced this verdict came from, and what they were.
     pub thresholds: Thresholds,
+    /// The rectangle a `box` answered with; `None` for every other type.
+    pub region: Option<Region>,
+}
+
+/// Where something is in an image, as fractions of its width and height from the top-left
+/// corner, so it maps onto the image at any size — including the original a caller shrank.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Region {
+    pub top: f64,
+    pub bottom: f64,
+    pub left: f64,
+    pub right: f64,
+}
+
+impl Region {
+    fn read(answer: &Value) -> Option<Region> {
+        let b = answer.get("box")?;
+        let edge = |k: &str| b.get(k).and_then(Value::as_f64);
+        let r = Region {
+            top: edge("top")?,
+            bottom: edge("bottom")?,
+            left: edge("left")?,
+            right: edge("right")?,
+        };
+        let unit = |v: f64| (0.0..=1.0).contains(&v);
+        (unit(r.top)
+            && unit(r.bottom)
+            && unit(r.left)
+            && unit(r.right)
+            && r.left < r.right
+            && r.top < r.bottom)
+            .then_some(r)
+    }
 }
 
 /// The cuts this verdict was read off, and who chose them.
@@ -275,6 +308,7 @@ pub fn outcome(
                 warning: None,
                 probabilities: None,
                 thresholds,
+                region: None,
             },
             None => missing(kind, thresholds),
         },
@@ -298,6 +332,7 @@ pub fn outcome(
                     warning: choice_faults(answer, offered),
                     probabilities: answer.get("probabilities").cloned(),
                     thresholds,
+                    region: None,
                 },
                 Some(label) => Outcome {
                     kind,
@@ -309,6 +344,7 @@ pub fn outcome(
                     warning: low_confidence(confidence, decide),
                     probabilities: answer.get("probabilities").cloned(),
                     thresholds,
+                    region: None,
                 },
                 // A shape we half understand degrades to "I don't know" rather than
                 // failing the whole call: this is exactly what a provider change looks
@@ -323,6 +359,7 @@ pub fn outcome(
                     warning: Some("incomplete_answer"),
                     probabilities: answer.get("probabilities").cloned(),
                     thresholds,
+                    region: None,
                 },
             }
         }
@@ -346,11 +383,30 @@ pub fn outcome(
                         warning: low_confidence(confidence, decide),
                         probabilities: answer.get("probabilities").cloned(),
                         thresholds,
+                        region: None,
                     }
                 }
                 None => missing(kind, thresholds),
             }
         }
+        // A box always comes back with a rectangle: asked for things that were not on the
+        // screen, it drew one 30 times out of 30. So the rectangle is the answer, the
+        // verdict says only that one arrived, and whether the thing is there at all is a
+        // question for a noul or a choice with a `none`.
+        "box" => match Region::read(answer) {
+            Some(region) => Outcome {
+                kind,
+                verdict: Verdict::Yes,
+                label: None,
+                number: None,
+                confidence: answer.get("confidence").and_then(Value::as_f64),
+                warning: None,
+                probabilities: None,
+                thresholds,
+                region: Some(region),
+            },
+            None => missing(kind, thresholds),
+        },
         _ => missing(kind, thresholds),
     };
 
@@ -371,6 +427,7 @@ fn missing(kind: String, thresholds: Thresholds) -> Outcome {
         warning: Some("incomplete_answer"),
         probabilities: None,
         thresholds,
+        region: None,
     }
 }
 
@@ -770,5 +827,39 @@ mod tests {
         );
         assert_eq!(out.thresholds.source, Source::Validated);
         assert_eq!(out.thresholds.yes, 0.8);
+    }
+
+    #[test]
+    fn a_box_hands_over_its_rectangle() {
+        let out = outcome(
+            &json!({"type":"box","box":{"top":0.07,"bottom":0.14,"left":0.85,"right":0.96},
+                    "confidence":0.75}),
+            &Decide::default(),
+            &no_provenance(),
+            &[],
+        );
+        assert_eq!(out.verdict, Verdict::Yes);
+        assert_eq!(out.confidence, Some(0.75));
+        let r = out.region.expect("a rectangle");
+        assert_eq!((r.top, r.bottom, r.left, r.right), (0.07, 0.14, 0.85, 0.96));
+    }
+
+    #[test]
+    fn a_rectangle_that_is_not_one_is_withheld() {
+        for b in [
+            json!({"top":0.5,"bottom":0.2,"left":0.1,"right":0.3}),
+            json!({"top":0.1,"bottom":0.2,"left":0.1,"right":1.4}),
+            json!({"top":0.1,"bottom":0.2,"left":0.1}),
+        ] {
+            let out = outcome(
+                &json!({"type":"box","box":b}),
+                &Decide::default(),
+                &no_provenance(),
+                &[],
+            );
+            assert_eq!(out.verdict, Verdict::Unsure, "{b}");
+            assert!(out.region.is_none());
+            assert_eq!(out.warning, Some("incomplete_answer"));
+        }
     }
 }

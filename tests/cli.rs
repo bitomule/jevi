@@ -306,3 +306,252 @@ mod criteria_note {
         );
     }
 }
+
+/// The image path end to end: the real binary, a real socket, and the request as it
+/// actually left. Everything here is checked on the bytes the server received, because the
+/// failure this guards against is the one already measured once — OpenRouter accepted a
+/// request whose image it had silently dropped, and answered anyway.
+mod images {
+    use super::*;
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+
+    /// A directory this test owns, removed when the test ends however it ends.
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(name: &str) -> Fixture {
+            let dir =
+                std::env::temp_dir().join(format!("jevi-images-{}-{name}", std::process::id()));
+            let fixture = Fixture(dir);
+            std::fs::create_dir_all(&fixture.0).expect("creates the fixture dir");
+            fixture
+        }
+
+        fn png(&self, file: &str, width: u32, height: u32) -> String {
+            let path = self.0.join(file);
+            image::RgbImage::from_pixel(width, height, image::Rgb([30, 60, 90]))
+                .save(&path)
+                .expect("writes the png");
+            path.to_string_lossy().into_owned()
+        }
+
+        fn config(&self, provider: &str, url: &str) -> PathBuf {
+            let path = self.0.join("config.json");
+            let body = serde_json::json!({
+                "provider": provider,
+                provider: { "api_key": "test", "base_url": url }
+            });
+            std::fs::write(&path, body.to_string()).expect("writes the config");
+            path
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Accepts one request, answers `reply`, and hands back the headers and the JSON body.
+    fn server(
+        reply: &'static str,
+    ) -> (String, std::thread::JoinHandle<(String, serde_json::Value)>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("has an address")
+        );
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accepts");
+            let mut req = Vec::new();
+            let mut buf = [0u8; 65536];
+            let (head, body) = loop {
+                let n = socket.read(&mut buf).expect("reads");
+                req.extend_from_slice(&buf[..n]);
+                let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&req[..end]).into_owned();
+                let want: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                if req.len() >= end + 4 + want || n == 0 {
+                    break (head, req[end + 4..].to_vec());
+                }
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            socket.write_all(response.as_bytes()).expect("replies");
+            let _ = socket.shutdown(std::net::Shutdown::Write);
+            (
+                head,
+                serde_json::from_slice(&body).expect("the body is JSON"),
+            )
+        });
+        (url, handle)
+    }
+
+    fn jevi(config: &Path, args: &[&str]) -> std::process::Output {
+        Command::cargo_bin("jevi")
+            .expect("binary is built")
+            .args(args)
+            .env("JEVI_CONFIG", config)
+            .env("JEVI_QUIET", "1")
+            .env_remove("OPENROUTER_API_KEY")
+            .env_remove("TYPESAFE_API_KEY")
+            .env_remove("JEVI_API_KEY")
+            .env_remove("JEVI_MODEL")
+            .env_remove("JEVI_PROVIDER")
+            .env_remove("JEVI_DISABLE")
+            .stdin(Stdio::null())
+            .output()
+            .expect("runs")
+    }
+
+    fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+    }
+
+    #[test]
+    fn a_screenshot_reaches_typesafe_shrunk_as_an_asset_with_the_header() {
+        let f = Fixture::new("typesafe");
+        let shot = f.png("shot.png", 1206, 2622);
+        let (url, server) = server(
+            r#"{"model":"jev-1.14.0","answers":{"answer":{"type":"box",
+               "box":{"top":0.07,"bottom":0.14,"left":0.85,"right":0.96},"confidence":0.75}}}"#,
+        );
+        let config = f.config("typesafe", &url);
+
+        let out = jevi(&config, &["ask", "the gear", "--box", "--image", &shot]);
+        let (head, body) = server.join().expect("the server saw a request");
+
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "top=0.070 bottom=0.140 left=0.850 right=0.960\t0.75\n"
+        );
+        assert_eq!(header(&head, "TypeSafe-Danger-Zone-Images"), Some("true"));
+        assert_eq!(
+            body["model"], "jev-1.14.0",
+            "a box goes to the first model that answers one"
+        );
+
+        let reference = body["state"]["screen"]
+            .as_str()
+            .expect("the state names the image");
+        let asset = &body["assets"][reference];
+        assert_eq!(asset["format"], "png");
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(asset["data_base64"].as_str().expect("base64"))
+            .expect("decodes");
+        let sent = image::load_from_memory(&bytes).expect("an image");
+        assert_eq!((sent.width(), sent.height()), (721, 1568));
+    }
+
+    #[test]
+    fn openrouter_gets_the_image_inline_next_to_the_text_and_no_assets() {
+        let f = Fixture::new("openrouter");
+        let shot = f.png("shot.png", 721, 1568);
+        let (url, server) = server(
+            r#"{"model":"typesafe/jev-1.13-20260917","answers":{"answer":{"type":"choice",
+               "choice":"1","confidence":0.9}}}"#,
+        );
+        let config = f.config("openrouter", &url);
+
+        let out = jevi(
+            &config,
+            &[
+                "ask",
+                "which element is the gear in `screen`",
+                "--options",
+                "1,none",
+                "--text",
+                "1) label=Ajustes",
+                "--image",
+                &format!("screen={shot}"),
+            ],
+        );
+        let (head, body) = server.join().expect("the server saw a request");
+
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            body["model"], "typesafe/jev-1.13",
+            "the default does not move"
+        );
+        assert_eq!(body["state"]["text"], "1) label=Ajustes");
+        assert_eq!(body["state"]["screen"]["type"], "image_url");
+        assert!(body["state"]["screen"]["image_url"]["url"]
+            .as_str()
+            .is_some_and(|u| u.starts_with("data:image/png;base64,")));
+        assert!(body.get("assets").is_none());
+        assert_eq!(header(&head, "TypeSafe-Danger-Zone-Images"), None);
+    }
+
+    #[test]
+    fn an_image_too_small_to_read_is_refused_before_the_network() {
+        let f = Fixture::new("small");
+        let icon = f.png("icon.png", 120, 120);
+        let out = run(&["ask", "is it a gear", "--image", &icon], "");
+        assert_eq!(out.status.code(), Some(5));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("too small"));
+    }
+
+    #[test]
+    fn a_missing_image_is_invalid_input() {
+        let out = run(
+            &["ask", "is it a gear", "--image", "/nonexistent/shot.png"],
+            "",
+        );
+        assert_eq!(out.status.code(), Some(5));
+    }
+
+    #[test]
+    fn a_box_pinned_to_a_model_that_cannot_answer_it_is_refused_up_front() {
+        let f = Fixture::new("pinned");
+        let shot = f.png("shot.png", 721, 1568);
+        let out = run(
+            &[
+                "ask",
+                "the gear",
+                "--box",
+                "--image",
+                &shot,
+                "--model",
+                "typesafe/jev-1.13",
+            ],
+            "",
+        );
+        assert_eq!(out.status.code(), Some(5));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cannot answer a `box`"));
+    }
+
+    #[test]
+    fn a_box_with_a_menu_is_a_flag_error_and_never_exit_2() {
+        let out = run(&["ask", "the gear", "--box", "--options", "a,b"], "");
+        assert_ne!(out.status.code(), Some(2));
+        assert_eq!(out.status.code(), Some(5));
+    }
+}
